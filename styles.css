@@ -102,7 +102,7 @@ body[class*="dark"] {
   position: fixed;
   top: 48px;
   right: 24px;
-  width: 320px;
+  width: 295px;
   max-height: calc(100vh - 24px);
   z-index: var(--cgx-z);
   background: var(--cgx-bg);
@@ -288,7 +288,7 @@ body[class*="dark"] {
 }
 
 .cgx-highlight {
-  animation: cgxFlash 1.2s ease-out 1;
+  animation: cgxFlash 1.3s ease-out 1;
   border-radius: 10px;
 }
 

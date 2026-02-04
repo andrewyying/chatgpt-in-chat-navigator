@@ -188,6 +188,8 @@
 
     sb = document.createElement("div");
     sb.id = SIDEBAR_ID;
+    sb.classList.add("cgx-hidden");
+    sb.setAttribute("aria-hidden", "true");
 
     sb.innerHTML = `
       <div id="cgx-header">
@@ -208,6 +210,7 @@
     `;
 
     document.documentElement.appendChild(sb);
+    ensureShowPill();
 
     // Hide button
     sb.querySelector("#cgx-hide").addEventListener("click", () => hideSidebar());

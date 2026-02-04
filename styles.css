@@ -100,10 +100,10 @@ body[class*="dark"] {
 /* Sidebar container */
 #cgx-sidebar {
   position: fixed;
-  top: 48px;
+  top: 56px;
   right: 24px;
   width: 295px;
-  max-height: calc(100vh - 24px);
+  max-height: 80vh;
   z-index: var(--cgx-z);
   background: var(--cgx-bg);
   border: 1px solid var(--cgx-border);
@@ -129,7 +129,7 @@ body[class*="dark"] {
 
 #cgx-show-pill {
   position: fixed;
-  top: 48px;
+  top: 56px;
   right: 24px;
   z-index: var(--cgx-z);
   padding: 8px;

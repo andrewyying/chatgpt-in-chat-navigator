@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "ChatGPT In-Chat Navigator",
   "version": "0.1.0",
-  "description": "Sidebar index of your questions + collapse/expand assistant replies on chatgpt.com",
+  "description": "Helps you jump between your questions and hide long answers in ChatGPT.",
   "permissions": ["storage"],
   "host_permissions": ["https://chatgpt.com/*"],
   "content_scripts": [

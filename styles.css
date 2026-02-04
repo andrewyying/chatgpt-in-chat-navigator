@@ -174,19 +174,6 @@ body[class*="dark"] {
   gap: 8px;
 }
 
-#cgx-title .dot {
-  width: 8px;
-  height: 8px;
-  border-radius: 999px;
-  background: var(--cgx-accent);
-  opacity: 0.8;
-}
-
-#cgx-title .cgx-count {
-  font-weight: 500;
-  color: var(--cgx-subtext);
-  font-size: 12px;
-}
 
 #cgx-actions {
   display: flex;

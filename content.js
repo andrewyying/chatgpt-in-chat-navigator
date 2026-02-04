@@ -25,8 +25,6 @@
   `;
 
   // ---------- Utilities ----------
-  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
   function getConversationKey() {
     return `${STORAGE_KEY_PREFIX}:${location.host}${location.pathname}`;
   }
@@ -102,7 +100,7 @@
     const blocks = [];
     for (const el of candidates) {
       if (isComposerArea(el)) continue;
-      const txt = (el.innerText || "").trim();
+      const txt = (el.textContent || "").trim();
       if (txt.length < 5) continue;
       const pCount = el.querySelectorAll("p").length;
       if (pCount === 0 && txt.length < 40) continue;
@@ -115,8 +113,8 @@
 
   function getRole(el) {
     const role = el.getAttribute?.("data-message-author-role");
-    if (role === "user" || role === "assistant" || role === "system") return role;
-    const t = (el.innerText || "").trim();
+    if (typeof role === "string" && role.length) return role;
+    const t = (el.textContent || "").trim();
     const hasCopy = !!el.querySelector?.('button[aria-label*="Copy"], button[aria-label*="copy"]');
     if (/^you\b/i.test(t)) return "user";
     if (/chatgpt/i.test(t)) return "assistant";
@@ -127,8 +125,17 @@
   function extractUserText(el) {
     // Try to get the direct textual content of the user message.
     // Prefer text from paragraphs; otherwise innerText.
-    const txt = (el.innerText || "").trim();
+    const txt = (el.textContent || "").trim();
     return txt;
+  }
+
+  function getCachedTitle(el) {
+    const cached = el.getAttribute?.(`data-${EXT_NS}-title`);
+    if (cached) return cached;
+    const raw = extractUserText(el);
+    const title = textPreview(raw.split("\n").find(Boolean) || raw, 90) || "[Media]";
+    el.setAttribute?.(`data-${EXT_NS}-title`, title);
+    return title;
   }
 
   function stableIdForElement(el, idx) {
@@ -464,8 +471,7 @@
 
       userCount++;
       const id = stableIdForElement(el, i);
-      const raw = extractUserText(el);
-      const title = textPreview(raw.split("\n").find(Boolean) || raw, 90);
+      const title = getCachedTitle(el);
       index.push({
         id,
         el,
@@ -476,6 +482,10 @@
     }
     document.querySelectorAll(`.${EXT_NS}-toggle`).forEach((btn) => {
       if (!keepToggles.has(btn)) btn.remove();
+    });
+    document.querySelectorAll(`.${EXT_NS}-toggle-wrap`).forEach((wrap) => {
+      const btn = wrap.querySelector?.(`.${EXT_NS}-toggle`);
+      if (!btn || !keepToggles.has(btn)) wrap.remove();
     });
     return index;
   }
@@ -492,6 +502,7 @@
   let debounceTimer = null;
   function scheduleScan() {
     if (!isChatRoute()) return;
+    if (observeTarget && !document.contains(observeTarget)) startObserver();
     if (debounceTimer) clearTimeout(debounceTimer);
     debounceTimer = setTimeout(() => {
       debounceTimer = null;
@@ -500,11 +511,14 @@
   }
 
   let mo = null;
+  let observeTarget = null;
   let lastPath = "";
 
   function startObserver() {
-    if (mo) return;
-    const observeTarget = document.querySelector("main") || document.body;
+    const nextTarget = document.querySelector("main") || document.body;
+    if (mo && observeTarget === nextTarget) return;
+    stopObserver();
+    observeTarget = nextTarget;
     mo = new MutationObserver(() => scheduleScan());
     mo.observe(observeTarget, { childList: true, subtree: true });
   }
@@ -514,6 +528,7 @@
       mo.disconnect();
       mo = null;
     }
+    observeTarget = null;
   }
 
   async function activateForChat() {
@@ -541,7 +556,24 @@
     }
   }
 
+  function installRouteListeners() {
+    if (window.__cgxRouteHooked) return;
+    window.__cgxRouteHooked = true;
+    const notify = () => window.dispatchEvent(new Event("cgx:locationchange"));
+    const wrap = (fn) =>
+      function (...args) {
+        const ret = fn.apply(this, args);
+        notify();
+        return ret;
+      };
+    if (history?.pushState) history.pushState = wrap(history.pushState);
+    if (history?.replaceState) history.replaceState = wrap(history.replaceState);
+    window.addEventListener("popstate", notify);
+    window.addEventListener("cgx:locationchange", () => handleRouteChange());
+  }
+
   async function init() {
+    installRouteListeners();
     await handleRouteChange();
     applyThemeFromDom();
     const themeObserver = new MutationObserver(() => applyThemeFromDom());
@@ -555,7 +587,7 @@
         attributeFilter: ["class", "data-theme", "data-color-mode", "data-color-scheme"]
       });
     }
-    setInterval(handleRouteChange, 700);
+    setInterval(handleRouteChange, 4000);
 
     window.addEventListener("keydown", (e) => {
       if (e.altKey && e.key.toLowerCase() === "n") {

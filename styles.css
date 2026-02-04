@@ -113,8 +113,18 @@ body[class*="dark"] {
   overflow: hidden;
   display: flex;
   flex-direction: column;
+  opacity: 1;
+  transform: translateY(0) scale(1);
+  transition: opacity 160ms ease, transform 160ms ease;
+  will-change: opacity, transform;
   font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji",
     "Segoe UI Emoji";
+}
+
+#cgx-sidebar.cgx-hidden {
+  opacity: 0;
+  transform: translateY(-6px) scale(0.98);
+  pointer-events: none;
 }
 
 #cgx-show-pill {

@@ -169,10 +169,7 @@
     document.documentElement.appendChild(sb);
 
     // Hide button
-    sb.querySelector("#cgx-hide").addEventListener("click", () => {
-      sb.style.display = "none";
-      ensureShowPill();
-    });
+    sb.querySelector("#cgx-hide").addEventListener("click", () => hideSidebar());
 
     // Search filter
     const search = sb.querySelector("#cgx-search");
@@ -198,18 +195,32 @@
 
     pill = document.createElement("div");
     pill.id = "cgx-show-pill";
-    pill.setAttribute("aria-label", "Show index");
-    pill.setAttribute("title", "Show index");
+    pill.setAttribute("aria-label", "Show sidebar (Alt+N)");
+    pill.setAttribute("title", "Show sidebar (Alt+N)");
     pill.innerHTML = BOOKMARK_SVG;
 
-    pill.addEventListener("click", () => {
-      const sb = ensureSidebar();
-      sb.style.display = "flex";
-      pill.remove();
-    });
+    pill.addEventListener("click", () => showSidebar());
 
     document.documentElement.appendChild(pill);
     return pill;
+  }
+
+  function isSidebarHidden(sb) {
+    return !!sb?.classList?.contains("cgx-hidden");
+  }
+
+  function showSidebar() {
+    const sb = ensureSidebar();
+    sb.classList.remove("cgx-hidden");
+    sb.setAttribute("aria-hidden", "false");
+    document.getElementById("cgx-show-pill")?.remove();
+  }
+
+  function hideSidebar() {
+    const sb = ensureSidebar();
+    sb.classList.add("cgx-hidden");
+    sb.setAttribute("aria-hidden", "true");
+    ensureShowPill();
   }
 
   // ---------- Storage ----------
@@ -552,13 +563,8 @@
         if (!isChatRoute()) return;
         const sb = document.getElementById(SIDEBAR_ID);
         if (!sb) return;
-        if (sb.style.display === "none") {
-          sb.style.display = "flex";
-          document.getElementById("cgx-show-pill")?.remove();
-        } else {
-          sb.style.display = "none";
-          ensureShowPill();
-        }
+        if (isSidebarHidden(sb)) showSidebar();
+        else hideSidebar();
       }
     });
   }

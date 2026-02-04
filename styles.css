@@ -92,6 +92,19 @@
   background: rgba(255, 255, 255, 1);
 }
 
+.cgx-icon-btn {
+  border: none;
+  background: transparent;
+  padding: 4px 6px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.cgx-icon-btn:hover {
+  background: rgba(0, 0, 0, 0.06);
+}
+
 #cgx-search {
   margin-top: 8px;
   width: 100%;

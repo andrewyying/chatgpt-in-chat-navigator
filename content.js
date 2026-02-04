@@ -3,6 +3,16 @@
   const SIDEBAR_ID = "cgx-sidebar";
   const STORAGE_KEY_PREFIX = "cgx_state_v1";
   const DEBOUNCE_MS = 450;
+  const BOOKMARK_SVG = `
+    <svg width="16" height="16" viewBox="0 0 24 24" aria-hidden="true">
+      <path fill="currentColor" d="M6 2c-1.1 0-2 .9-2 2v16l8-3.2 8 3.2V4c0-1.1-.9-2-2-2H6zm0 2h12v13.2l-6-2.4-6 2.4V4z"/>
+    </svg>
+  `;
+  const MINUS_SVG = `
+    <svg width="16" height="16" viewBox="0 0 24 24" aria-hidden="true">
+      <rect x="6" y="11" width="12" height="2" fill="currentColor" rx="1" />
+    </svg>
+  `;
 
   // ---------- Utilities ----------
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -100,8 +110,10 @@
     sb.innerHTML = `
       <div id="cgx-header">
         <div id="cgx-title-row">
-          <div id="cgx-title"><span class="dot"></span> Chat index</div>
-          <button class="cgx-btn" id="cgx-hide" title="Hide sidebar (Alt+N to show again)">Hide</button>
+          <div id="cgx-title">${BOOKMARK_SVG}</div>
+          <button class="cgx-btn cgx-icon-btn" id="cgx-hide" title="Hide sidebar (Alt+N to show again)" aria-label="Hide sidebar">
+            ${MINUS_SVG}
+          </button>
         </div>
         <input id="cgx-search" placeholder="Search questions…" />
         <div id="cgx-actions">
@@ -149,7 +161,7 @@
     pill.style.top = "48px";
     pill.style.right = "24px";
     pill.style.zIndex = "2147483647";
-    pill.style.padding = "8px 10px";
+    pill.style.padding = "8px";
     pill.style.borderRadius = "var(--cgx-radius)";
     pill.style.border = "1px solid rgba(0,0,0,0.12)";
     pill.style.background = "rgba(255,255,255,0.92)";
@@ -160,7 +172,9 @@
       'ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji","Segoe UI Emoji"';
     pill.style.fontSize = "12px";
     pill.style.color = "rgba(0,0,0,0.86)";
-    pill.textContent = "Show index";
+    pill.setAttribute("aria-label", "Show index");
+    pill.setAttribute("title", "Show index");
+    pill.innerHTML = BOOKMARK_SVG;
 
     pill.addEventListener("click", () => {
       const sb = ensureSidebar();
@@ -313,15 +327,12 @@
       return (it.title || "").toLowerCase().includes(filterLower);
     });
 
-    if (titleEl) {
-      const total = (indexItems || []).length;
-      titleEl.innerHTML = total ? `<span class="dot"></span> Chat index <span class="cgx-count">(${total})</span>` : "<span class=\"dot\"></span> Chat index";
-    }
+    titleEl.innerHTML = BOOKMARK_SVG;
 
     if (!items.length) {
       const div = document.createElement("div");
       div.className = "cgx-muted";
-      div.textContent = "No questions found. Try \"Refresh\" after messages load.";
+      div.textContent = "No questions found.";
       list.appendChild(div);
       return;
     }

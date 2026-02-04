@@ -8,6 +8,93 @@
   --cgx-shadow: 0 10px 30px rgba(0, 0, 0, 0.18);
   --cgx-radius: 12px;
   --cgx-accent: rgba(0, 0, 0, 0.86);
+  --cgx-btn-bg: rgba(255, 255, 255, 0.8);
+  --cgx-btn-bg-hover: rgba(255, 255, 255, 1);
+  --cgx-item-bg: rgba(255, 255, 255, 0.75);
+  --cgx-item-bg-hover: rgba(255, 255, 255, 1);
+  --cgx-input-bg: rgba(255, 255, 255, 0.95);
+  --cgx-toggle-bg: rgba(255, 255, 255, 0.95);
+  --cgx-toggle-bg-hover: rgba(255, 255, 255, 1);
+  --cgx-icon-hover: rgba(0, 0, 0, 0.06);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --cgx-border: rgba(255, 255, 255, 0.14);
+    --cgx-bg: rgba(28, 28, 30, 0.96);
+    --cgx-bg2: rgba(36, 36, 38, 0.96);
+    --cgx-text: rgba(255, 255, 255, 0.92);
+    --cgx-subtext: rgba(255, 255, 255, 0.6);
+    --cgx-shadow: 0 10px 30px rgba(0, 0, 0, 0.55);
+    --cgx-accent: rgba(255, 255, 255, 0.9);
+    --cgx-btn-bg: rgba(58, 58, 60, 0.9);
+    --cgx-btn-bg-hover: rgba(72, 72, 74, 1);
+    --cgx-item-bg: rgba(44, 44, 46, 0.9);
+    --cgx-item-bg-hover: rgba(58, 58, 60, 1);
+    --cgx-input-bg: rgba(44, 44, 46, 0.95);
+    --cgx-toggle-bg: rgba(58, 58, 60, 0.9);
+    --cgx-toggle-bg-hover: rgba(72, 72, 74, 1);
+    --cgx-icon-hover: rgba(255, 255, 255, 0.08);
+  }
+}
+
+html.dark,
+body.dark,
+html[data-theme="dark"],
+body[data-theme="dark"],
+html[class*="dark"],
+body[class*="dark"] {
+  --cgx-border: rgba(255, 255, 255, 0.14);
+  --cgx-bg: rgba(28, 28, 30, 0.96);
+  --cgx-bg2: rgba(36, 36, 38, 0.96);
+  --cgx-text: rgba(255, 255, 255, 0.92);
+  --cgx-subtext: rgba(255, 255, 255, 0.6);
+  --cgx-shadow: 0 10px 30px rgba(0, 0, 0, 0.55);
+  --cgx-accent: rgba(255, 255, 255, 0.9);
+  --cgx-btn-bg: rgba(58, 58, 60, 0.9);
+  --cgx-btn-bg-hover: rgba(72, 72, 74, 1);
+  --cgx-item-bg: rgba(44, 44, 46, 0.9);
+  --cgx-item-bg-hover: rgba(58, 58, 60, 1);
+  --cgx-input-bg: rgba(44, 44, 46, 0.95);
+  --cgx-toggle-bg: rgba(58, 58, 60, 0.9);
+  --cgx-toggle-bg-hover: rgba(72, 72, 74, 1);
+  --cgx-icon-hover: rgba(255, 255, 255, 0.08);
+}
+
+:root[data-cgx-theme="dark"] {
+  --cgx-border: rgba(255, 255, 255, 0.14);
+  --cgx-bg: rgba(28, 28, 30, 0.96);
+  --cgx-bg2: rgba(36, 36, 38, 0.96);
+  --cgx-text: rgba(255, 255, 255, 0.92);
+  --cgx-subtext: rgba(255, 255, 255, 0.6);
+  --cgx-shadow: 0 10px 30px rgba(0, 0, 0, 0.55);
+  --cgx-accent: rgba(255, 255, 255, 0.9);
+  --cgx-btn-bg: rgba(58, 58, 60, 0.9);
+  --cgx-btn-bg-hover: rgba(72, 72, 74, 1);
+  --cgx-item-bg: rgba(44, 44, 46, 0.9);
+  --cgx-item-bg-hover: rgba(58, 58, 60, 1);
+  --cgx-input-bg: rgba(44, 44, 46, 0.95);
+  --cgx-toggle-bg: rgba(58, 58, 60, 0.9);
+  --cgx-toggle-bg-hover: rgba(72, 72, 74, 1);
+  --cgx-icon-hover: rgba(255, 255, 255, 0.08);
+}
+
+:root[data-cgx-theme="light"] {
+  --cgx-border: rgba(0, 0, 0, 0.12);
+  --cgx-bg: rgba(255, 255, 255, 0.92);
+  --cgx-bg2: rgba(250, 250, 250, 0.92);
+  --cgx-text: rgba(0, 0, 0, 0.86);
+  --cgx-subtext: rgba(0, 0, 0, 0.55);
+  --cgx-shadow: 0 10px 30px rgba(0, 0, 0, 0.18);
+  --cgx-accent: rgba(0, 0, 0, 0.86);
+  --cgx-btn-bg: rgba(255, 255, 255, 0.8);
+  --cgx-btn-bg-hover: rgba(255, 255, 255, 1);
+  --cgx-item-bg: rgba(255, 255, 255, 0.75);
+  --cgx-item-bg-hover: rgba(255, 255, 255, 1);
+  --cgx-input-bg: rgba(255, 255, 255, 0.95);
+  --cgx-toggle-bg: rgba(255, 255, 255, 0.95);
+  --cgx-toggle-bg-hover: rgba(255, 255, 255, 1);
+  --cgx-icon-hover: rgba(0, 0, 0, 0.06);
 }
 
 /* Sidebar container */
@@ -28,6 +115,27 @@
   flex-direction: column;
   font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji",
     "Segoe UI Emoji";
+}
+
+#cgx-show-pill {
+  position: fixed;
+  top: 48px;
+  right: 24px;
+  z-index: var(--cgx-z);
+  padding: 8px;
+  border-radius: var(--cgx-radius);
+  border: 1px solid var(--cgx-border);
+  background: var(--cgx-bg);
+  box-shadow: var(--cgx-shadow);
+  backdrop-filter: blur(10px);
+  cursor: pointer;
+  font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji",
+    "Segoe UI Emoji";
+  font-size: 12px;
+  color: var(--cgx-text);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
 }
 
 #cgx-sidebar * {
@@ -79,7 +187,7 @@
 
 .cgx-btn {
   border: 1px solid var(--cgx-border);
-  background: rgba(255, 255, 255, 0.8);
+  background: var(--cgx-btn-bg);
   color: var(--cgx-text);
   font-size: 12px;
   padding: 6px 8px;
@@ -89,7 +197,7 @@
 }
 
 .cgx-btn:hover {
-  background: rgba(255, 255, 255, 1);
+  background: var(--cgx-btn-bg-hover);
 }
 
 .cgx-icon-btn {
@@ -102,7 +210,7 @@
 }
 
 .cgx-icon-btn:hover {
-  background: rgba(0, 0, 0, 0.06);
+  background: var(--cgx-icon-hover);
 }
 
 #cgx-search {
@@ -113,7 +221,7 @@
   padding: 7px 10px;
   font-size: 12px;
   outline: none;
-  background: rgba(255, 255, 255, 0.95);
+  background: var(--cgx-input-bg);
   color: var(--cgx-text);
   caret-color: var(--cgx-text);
 }
@@ -135,14 +243,14 @@
 
 .cgx-item {
   border: 1px solid var(--cgx-border);
-  background: rgba(255, 255, 255, 0.75);
+  background: var(--cgx-item-bg);
   border-radius: 10px;
   padding: 8px 9px;
   cursor: pointer;
 }
 
 .cgx-item:hover {
-  background: rgba(255, 255, 255, 1);
+  background: var(--cgx-item-bg-hover);
 }
 
 .cgx-item .q {
@@ -212,7 +320,7 @@
   width: 80px;
   z-index: var(--cgx-z);
   border: 1px solid var(--cgx-border);
-  background: rgba(255, 255, 255, 0.95);
+  background: var(--cgx-toggle-bg);
   color: var(--cgx-text);
   font-size: 11px;
   font-weight: 500;
@@ -224,6 +332,6 @@
 }
 
 .cgx-toggle:hover {
-  background: #fff;
+  background: var(--cgx-toggle-bg-hover);
   box-shadow: 0 2px 8px rgba(0, 0, 0, 0.12);
 }

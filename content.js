@@ -38,6 +38,32 @@
     return !!el.querySelector("textarea, [contenteditable='true'], [data-testid*='prompt']");
   }
 
+  function detectThemeFromDom() {
+    const attrKeys = ["data-theme", "data-color-mode", "data-color-scheme"];
+    const els = [document.documentElement, document.body];
+    for (const el of els) {
+      if (!el) continue;
+      for (const key of attrKeys) {
+        const val = el.getAttribute?.(key);
+        if (val) {
+          const v = String(val).toLowerCase();
+          if (v.includes("dark")) return "dark";
+          if (v.includes("light")) return "light";
+        }
+      }
+      const cls = el.className || "";
+      if (/\bdark\b/i.test(cls)) return "dark";
+      if (/\blight\b/i.test(cls)) return "light";
+    }
+    return null;
+  }
+
+  function applyThemeFromDom() {
+    const theme = detectThemeFromDom();
+    if (theme) document.documentElement.setAttribute("data-cgx-theme", theme);
+    else document.documentElement.removeAttribute("data-cgx-theme");
+  }
+
   function isChatRoute(pathname = location.pathname) {
     return /^\/c\/[^/]+/.test(pathname);
   }
@@ -157,21 +183,6 @@
 
     pill = document.createElement("div");
     pill.id = "cgx-show-pill";
-    pill.style.position = "fixed";
-    pill.style.top = "48px";
-    pill.style.right = "24px";
-    pill.style.zIndex = "2147483647";
-    pill.style.padding = "8px";
-    pill.style.borderRadius = "var(--cgx-radius)";
-    pill.style.border = "1px solid rgba(0,0,0,0.12)";
-    pill.style.background = "rgba(255,255,255,0.92)";
-    pill.style.boxShadow = "0 10px 30px rgba(0,0,0,0.18)";
-    pill.style.backdropFilter = "blur(10px)";
-    pill.style.cursor = "pointer";
-    pill.style.fontFamily =
-      'ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji","Segoe UI Emoji"';
-    pill.style.fontSize = "12px";
-    pill.style.color = "rgba(0,0,0,0.86)";
     pill.setAttribute("aria-label", "Show index");
     pill.setAttribute("title", "Show index");
     pill.innerHTML = BOOKMARK_SVG;
@@ -414,7 +425,7 @@
       index.push({
         id,
         el,
-        title: title || "(空)",
+        title: title || "[Media]",
         idx: userCount,
         anchorHint: ""
       });
@@ -488,6 +499,18 @@
 
   async function init() {
     await handleRouteChange();
+    applyThemeFromDom();
+    const themeObserver = new MutationObserver(() => applyThemeFromDom());
+    themeObserver.observe(document.documentElement, {
+      attributes: true,
+      attributeFilter: ["class", "data-theme", "data-color-mode", "data-color-scheme"]
+    });
+    if (document.body) {
+      themeObserver.observe(document.body, {
+        attributes: true,
+        attributeFilter: ["class", "data-theme", "data-color-mode", "data-color-scheme"]
+      });
+    }
     setInterval(handleRouteChange, 700);
 
     window.addEventListener("keydown", (e) => {

@@ -13,6 +13,16 @@
       <rect x="6" y="11" width="12" height="2" fill="currentColor" rx="1" />
     </svg>
   `;
+  const EXPAND_SVG = `
+    <svg width="16" height="16" viewBox="0 0 24 24" aria-hidden="true">
+      <path fill="currentColor" d="M7.4 9.6L12 14.2l4.6-4.6L18 11l-6 6-6-6z"/>
+    </svg>
+  `;
+  const COLLAPSE_SVG = `
+    <svg width="16" height="16" viewBox="0 0 24 24" aria-hidden="true">
+      <path fill="currentColor" d="M7.4 14.4L12 9.8l4.6 4.6L18 13l-6-6-6 6z"/>
+    </svg>
+  `;
 
   // ---------- Utilities ----------
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -25,6 +35,11 @@
     if (!s) return "";
     const t = s.replace(/\s+/g, " ").trim();
     return t.length > max ? t.slice(0, max - 1) + "…" : t;
+  }
+
+  function safeAttrSelector(value) {
+    if (window.CSS && CSS.escape) return CSS.escape(value);
+    return String(value).replace(/"/g, '\\"');
   }
 
   function isElementVisible(el) {
@@ -219,11 +234,11 @@
     return !!stateCache.collapsed?.[messageId];
   }
 
-  async function setCollapsed(messageId, value) {
+  function setCollapsed(messageId, value) {
     stateCache.collapsed = stateCache.collapsed || {};
     if (value) stateCache.collapsed[messageId] = true;
     else delete stateCache.collapsed[messageId];
-    await saveState(stateCache);
+    saveState(stateCache);
   }
 
   function findAssistantContentContainer(blockEl) {
@@ -279,16 +294,30 @@
       const collapsed = isCollapsed(messageId);
       if (collapsed) content.classList.add("cgx-collapsed");
       else content.classList.remove("cgx-collapsed");
-      btn.textContent = collapsed ? "Expand" : "Collapse";
+      btn.innerHTML = collapsed ? EXPAND_SVG : COLLAPSE_SVG;
+      btn.setAttribute("aria-label", collapsed ? "Expand" : "Collapse");
+      btn.setAttribute("title", collapsed ? "Expand" : "Collapse");
     };
+
+    btn.dataset.cgxTarget = messageId;
 
     if (!btn.dataset?.cgxBound) {
       btn.dataset.cgxBound = "1";
-      btn.addEventListener("click", async (e) => {
+      btn.addEventListener("click", (e) => {
         e.stopPropagation();
-        const next = !isCollapsed(messageId);
-        await setCollapsed(messageId, next);
-        apply();
+        const targetId = btn.dataset.cgxTarget;
+        if (!targetId) return;
+        const targetEl = document.querySelector(`[data-${EXT_NS}-id="${safeAttrSelector(targetId)}"]`);
+        if (!targetEl) return;
+        const targetContent = findAssistantContentContainer(targetEl);
+        if (!targetContent) return;
+        const next = !isCollapsed(targetId);
+        setCollapsed(targetId, next);
+        if (next) targetContent.classList.add("cgx-collapsed");
+        else targetContent.classList.remove("cgx-collapsed");
+        btn.innerHTML = next ? EXPAND_SVG : COLLAPSE_SVG;
+        btn.setAttribute("aria-label", next ? "Expand" : "Collapse");
+        btn.setAttribute("title", next ? "Expand" : "Collapse");
       });
     }
 
@@ -379,7 +408,11 @@
               const content = findAssistantContentContainer(next);
               content?.classList?.remove("cgx-collapsed");
               const toggleBtn = next.querySelector?.(`.${EXT_NS}-toggle`);
-              if (toggleBtn) toggleBtn.textContent = "Collapse";
+              if (toggleBtn) {
+                toggleBtn.innerHTML = COLLAPSE_SVG;
+                toggleBtn.setAttribute("aria-label", "Collapse");
+                toggleBtn.setAttribute("title", "Collapse");
+              }
             }
           }
         }

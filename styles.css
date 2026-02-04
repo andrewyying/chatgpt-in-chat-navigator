@@ -317,17 +317,20 @@ body[class*="dark"] {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 80px;
+  width: 32px;
+  height: 24px;
   z-index: var(--cgx-z);
-  border: 1px solid var(--cgx-border);
+  border: none;
   background: var(--cgx-toggle-bg);
   color: var(--cgx-text);
   font-size: 11px;
   font-weight: 500;
-  padding: 4px 10px;
+  padding: 0;
   border-radius: 8px;
   cursor: pointer;
   user-select: none;
+  touch-action: manipulation;
+  pointer-events: auto;
   box-shadow: 0 1px 4px rgba(0, 0, 0, 0.08);
 }
 

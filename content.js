@@ -3,6 +3,11 @@
   const SIDEBAR_ID = "cgx-sidebar";
   const STORAGE_KEY_PREFIX = "cgx_state_v1";
   const DEBOUNCE_MS = 450;
+  const IDLE_TIMEOUT_MS = 1200;
+  const MESSAGE_ROLE_SELECTOR = "[data-message-author-role]";
+  const MESSAGE_ID_SELECTOR = "[data-message-id]";
+  const TURN_SELECTOR = "article[data-testid^='conversation-turn-'], [data-turn-id]";
+  const LIKELY_MESSAGE_SELECTOR = `${MESSAGE_ROLE_SELECTOR}, ${MESSAGE_ID_SELECTOR}, ${TURN_SELECTOR}`;
   const BOOKMARK_SVG = `
     <svg width="16" height="16" viewBox="0 0 24 24" aria-hidden="true">
       <path fill="currentColor" d="M6 2c-1.1 0-2 .9-2 2v16l8-3.2 8 3.2V4c0-1.1-.9-2-2-2H6zm0 2h12v13.2l-6-2.4-6 2.4V4z"/>
@@ -87,14 +92,38 @@
     document.querySelectorAll(`.${EXT_NS}-toggle, .${EXT_NS}-toggle-wrap`).forEach((el) => el.remove());
   }
 
+  function isLikelyMessageNode(node) {
+    if (!node || (node.nodeType !== 1 && node.nodeType !== 11)) return false;
+    const el = node;
+    if (el.matches?.(LIKELY_MESSAGE_SELECTOR)) return true;
+    return !!el.querySelector?.(LIKELY_MESSAGE_SELECTOR);
+  }
+
+  function mutationHasMessageChange(records) {
+    for (const m of records) {
+      if (m.type !== "childList") continue;
+      if (m.addedNodes) {
+        for (const node of m.addedNodes) {
+          if (isLikelyMessageNode(node)) return true;
+        }
+      }
+      if (m.removedNodes) {
+        for (const node of m.removedNodes) {
+          if (isLikelyMessageNode(node)) return true;
+        }
+      }
+    }
+    return false;
+  }
+
   // Find message blocks: prefer role attribute, then article/group wrappers.
   function findAllMessageBlocks() {
-    const roleNodes = document.querySelectorAll("[data-message-author-role]");
+    const roleNodes = document.querySelectorAll(MESSAGE_ROLE_SELECTOR);
     if (roleNodes?.length) return Array.from(roleNodes);
 
-    // Alternative: ChatGPT sometimes wraps in articles; use group or article as block.
-    const articles = document.querySelectorAll("main article[class], main [data-message-id]");
-    if (articles?.length) return Array.from(articles);
+    // Alternative: ChatGPT sometimes wraps turns in articles; prefer turn/message IDs.
+    const turns = document.querySelectorAll(`main ${TURN_SELECTOR}, main ${MESSAGE_ID_SELECTOR}`);
+    if (turns?.length) return Array.from(turns);
 
     const candidates = document.querySelectorAll("main div, main article, main section");
     const blocks = [];
@@ -112,7 +141,10 @@
   }
 
   function getRole(el) {
-    const role = el.getAttribute?.("data-message-author-role");
+    const role =
+      el.getAttribute?.("data-message-author-role") ||
+      el.getAttribute?.("data-turn") ||
+      el.closest?.("[data-turn]")?.getAttribute?.("data-turn");
     if (typeof role === "string" && role.length) return role;
     const t = (el.textContent || "").trim();
     const hasCopy = !!el.querySelector?.('button[aria-label*="Copy"], button[aria-label*="copy"]');
@@ -141,8 +173,10 @@
   function stableIdForElement(el, idx) {
     const existing = el.getAttribute(`data-${EXT_NS}-id`);
     if (existing) return existing;
-    const dataId = el.getAttribute?.("data-message-id") ?? el.closest?.("[data-message-id]")?.getAttribute?.("data-message-id");
-    const base = dataId || `${idx.toString(36)}_${Math.random().toString(36).slice(2, 9)}`;
+    const dataId =
+      el.getAttribute?.("data-message-id") ?? el.closest?.("[data-message-id]")?.getAttribute?.("data-message-id");
+    const turnId = el.getAttribute?.("data-turn-id") ?? el.closest?.("[data-turn-id]")?.getAttribute?.("data-turn-id");
+    const base = dataId || turnId || `${idx.toString(36)}_${Math.random().toString(36).slice(2, 9)}`;
     const id = `${EXT_NS}_${base}`;
     el.setAttribute(`data-${EXT_NS}-id`, id);
     return id;
@@ -183,6 +217,7 @@
     search.addEventListener("input", () => {
       const q = (search.value || "").trim().toLowerCase();
       renderList(currentIndex, q);
+      lastRenderedFilter = q;
     });
 
     // Refresh
@@ -373,6 +408,16 @@
 
   // ---------- Sidebar index ----------
   let currentIndex = []; // {id, el, title, idx}
+  let lastRenderedFilter = "";
+
+  function isSameIndex(prev, next) {
+    if (prev.length !== next.length) return false;
+    for (let i = 0; i < next.length; i++) {
+      if (prev[i].id !== next[i].id) return false;
+      if (prev[i].title !== next[i].title) return false;
+    }
+    return true;
+  }
 
   function renderList(indexItems, filterLower) {
     const sb = ensureSidebar();
@@ -395,13 +440,21 @@
       return;
     }
 
+    const fragment = document.createDocumentFragment();
     for (const it of items) {
       const card = document.createElement("div");
       card.className = "cgx-item";
-      card.innerHTML = `
-        <div class="meta"><span>#${it.idx}</span><span>${it.anchorHint || ""}</span></div>
-        <div class="q">${escapeHtml(it.title)}</div>
-      `;
+      const meta = document.createElement("div");
+      meta.className = "meta";
+      const spanIdx = document.createElement("span");
+      spanIdx.textContent = `#${it.idx}`;
+      const spanHint = document.createElement("span");
+      spanHint.textContent = it.anchorHint || "";
+      meta.append(spanIdx, spanHint);
+      const q = document.createElement("div");
+      q.className = "q";
+      q.textContent = it.title || "";
+      card.append(meta, q);
       card.addEventListener("click", () => {
         if (!it.el || !document.contains(it.el)) {
           scanAndRender();
@@ -435,20 +488,51 @@
           }
         }
       });
-      list.appendChild(card);
+      fragment.appendChild(card);
     }
+    list.appendChild(fragment);
   }
 
-  function escapeHtml(str) {
-    return (str || "")
-      .replaceAll("&", "&amp;")
-      .replaceAll("<", "&lt;")
-      .replaceAll(">", "&gt;")
-      .replaceAll('"', "&quot;")
-      .replaceAll("'", "&#039;");
+  function getRoleNodesFast() {
+    const userNodes = document.querySelectorAll("[data-message-author-role='user']");
+    const assistantNodes = document.querySelectorAll("[data-message-author-role='assistant']");
+    if (!userNodes.length && !assistantNodes.length) return null;
+    return { userNodes, assistantNodes };
   }
 
-  function scanIndex() {
+  function scanIndexFast(userNodes, assistantNodes) {
+    const index = [];
+    let userCount = 0;
+
+    for (let i = 0; i < assistantNodes.length; i++) {
+      const el = assistantNodes[i];
+      if (isComposerArea(el)) continue;
+      const id = stableIdForElement(el, i);
+      const existing = el.querySelector?.(`button.${EXT_NS}-toggle`);
+      if (!existing || existing.dataset?.cgxBound !== "1") {
+        injectToggleForAssistant(el, id);
+      }
+    }
+
+    for (let i = 0; i < userNodes.length; i++) {
+      const el = userNodes[i];
+      if (isComposerArea(el)) continue;
+      userCount++;
+      const id = stableIdForElement(el, i);
+      const title = getCachedTitle(el);
+      index.push({
+        id,
+        el,
+        title: title || "[Media]",
+        idx: userCount,
+        anchorHint: ""
+      });
+    }
+
+    return index;
+  }
+
+  function scanIndexFallback() {
     const blocks = findAllMessageBlocks();
     const index = [];
     let userCount = 0;
@@ -490,23 +574,49 @@
     return index;
   }
 
+  function scanIndex() {
+    const roleNodes = getRoleNodesFast();
+    if (roleNodes) return scanIndexFast(roleNodes.userNodes, roleNodes.assistantNodes);
+    return scanIndexFallback();
+  }
+
   async function scanAndRender() {
     if (!isChatRoute()) return;
-    currentIndex = scanIndex();
+    const nextIndex = scanIndex();
+    const changed = !isSameIndex(currentIndex, nextIndex);
+    currentIndex = nextIndex;
     const sb = ensureSidebar();
     const q = (sb.querySelector("#cgx-search").value || "").trim().toLowerCase();
-    renderList(currentIndex, q);
+    if (changed || q !== lastRenderedFilter) {
+      renderList(currentIndex, q);
+      lastRenderedFilter = q;
+    }
   }
 
   // ---------- Observe & init ----------
   let debounceTimer = null;
+  let idleHandle = null;
   function scheduleScan() {
     if (!isChatRoute()) return;
     if (observeTarget && !document.contains(observeTarget)) startObserver();
     if (debounceTimer) clearTimeout(debounceTimer);
     debounceTimer = setTimeout(() => {
       debounceTimer = null;
-      scanAndRender();
+      if (idleHandle && window.cancelIdleCallback) {
+        cancelIdleCallback(idleHandle);
+        idleHandle = null;
+      }
+      if (window.requestIdleCallback) {
+        idleHandle = requestIdleCallback(
+          () => {
+            idleHandle = null;
+            scanAndRender();
+          },
+          { timeout: IDLE_TIMEOUT_MS }
+        );
+      } else {
+        scanAndRender();
+      }
     }, DEBOUNCE_MS);
   }
 
@@ -519,7 +629,10 @@
     if (mo && observeTarget === nextTarget) return;
     stopObserver();
     observeTarget = nextTarget;
-    mo = new MutationObserver(() => scheduleScan());
+    mo = new MutationObserver((records) => {
+      if (!mutationHasMessageChange(records)) return;
+      scheduleScan();
+    });
     mo.observe(observeTarget, { childList: true, subtree: true });
   }
 
@@ -534,6 +647,8 @@
   async function activateForChat() {
     stateCache = await loadState();
     stateCache.collapsed = stateCache.collapsed || {};
+    currentIndex = [];
+    lastRenderedFilter = "";
     ensureSidebar();
     await scanAndRender();
     startObserver();
@@ -542,6 +657,8 @@
   function deactivateForNonChat() {
     stopObserver();
     removeInjectedUI();
+    currentIndex = [];
+    lastRenderedFilter = "";
   }
 
   async function handleRouteChange() {

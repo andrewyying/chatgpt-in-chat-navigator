@@ -2,12 +2,84 @@
   const EXT_NS = "cgx";
   const SIDEBAR_ID = "cgx-sidebar";
   const STORAGE_KEY_PREFIX = "cgx_state_v1";
+  const PREFS_KEY = "cgx_prefs_v1";
   const DEBOUNCE_MS = 450;
   const IDLE_TIMEOUT_MS = 1200;
   const MESSAGE_ROLE_SELECTOR = "[data-message-author-role]";
   const MESSAGE_ID_SELECTOR = "[data-message-id]";
   const TURN_SELECTOR = "article[data-testid^='conversation-turn-'], [data-turn-id]";
   const LIKELY_MESSAGE_SELECTOR = `${MESSAGE_ROLE_SELECTOR}, ${MESSAGE_ID_SELECTOR}, ${TURN_SELECTOR}`;
+  const ATTACHMENT_NODE_SELECTOR = [
+    "a[download]",
+    "a[href*='/files/']",
+    "a[href^='sandbox:']",
+    "[data-testid*='attachment']",
+    "[data-testid*='file']",
+    "[aria-label*='attachment' i]",
+    "[aria-label*='file' i]"
+  ].join(", ");
+  const FILE_NAME_EXTENSIONS = new Set([
+    "pdf",
+    "doc",
+    "docx",
+    "txt",
+    "md",
+    "rtf",
+    "csv",
+    "tsv",
+    "xls",
+    "xlsx",
+    "ppt",
+    "pptx",
+    "json",
+    "xml",
+    "yaml",
+    "yml",
+    "zip",
+    "rar",
+    "7z",
+    "tar",
+    "gz",
+    "png",
+    "jpg",
+    "jpeg",
+    "gif",
+    "webp",
+    "bmp",
+    "svg",
+    "heic",
+    "heif",
+    "mp3",
+    "wav",
+    "m4a",
+    "ogg",
+    "aac",
+    "flac",
+    "mp4",
+    "mov",
+    "avi",
+    "mkv",
+    "webm",
+    "srt",
+    "vtt",
+    "py",
+    "js",
+    "jsx",
+    "ts",
+    "tsx",
+    "css",
+    "html",
+    "sql",
+    "ipynb"
+  ]);
+  const FILE_EXT_PATTERN = Array.from(FILE_NAME_EXTENSIONS)
+    .sort((a, b) => b.length - a.length)
+    .map((ext) => ext.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+    .join("|");
+  const FILE_NAME_IN_TEXT_RE = new RegExp(
+    `([A-Za-z0-9][A-Za-z0-9 _().-]{0,118}\\.(?:${FILE_EXT_PATTERN}))(?=$|[^A-Za-z0-9]|[A-Z]{2,}(?=[a-z]))`,
+    "gi"
+  );
   const BOOKMARK_SVG = `
     <svg width="16" height="16" viewBox="0 0 24 24" aria-hidden="true">
       <path fill="currentColor" d="M6 2c-1.1 0-2 .9-2 2v16l8-3.2 8 3.2V4c0-1.1-.9-2-2-2H6zm0 2h12v13.2l-6-2.4-6 2.4V4z"/>
@@ -28,6 +100,7 @@
       <path fill="currentColor" d="M7.4 14.4L12 9.8l4.6 4.6L18 13l-6-6-6 6z"/>
     </svg>
   `;
+  let prefsCache = { hiddenByDefault: false };
 
   // ---------- Utilities ----------
   function getConversationKey() {
@@ -38,6 +111,183 @@
     if (!s) return "";
     const t = s.replace(/\s+/g, " ").trim();
     return t.length > max ? t.slice(0, max - 1) + "…" : t;
+  }
+
+  function dedupeStrings(values) {
+    const seen = new Set();
+    const out = [];
+    for (const raw of values || []) {
+      const v = String(raw || "").trim();
+      if (!v) continue;
+      const key = v.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push(v);
+    }
+    return out;
+  }
+
+  function sanitizeFileNameCandidate(value) {
+    return String(value || "")
+      .replace(/\s+/g, " ")
+      .trim()
+      .replace(/^[`"'([{<\s]+|[`"')\]}>.,;:!?]+$/g, "");
+  }
+
+  function escapeRegExp(value) {
+    return String(value || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  }
+
+  function isLikelyFileName(value) {
+    const name = sanitizeFileNameCandidate(value);
+    if (!name) return false;
+    if (name.length < 3 || name.length > 140) return false;
+    if (/[\/\\]/.test(name)) return false;
+    const dot = name.lastIndexOf(".");
+    if (dot <= 0 || dot === name.length - 1) return false;
+    const ext = name.slice(dot + 1).toLowerCase();
+    return FILE_NAME_EXTENSIONS.has(ext);
+  }
+
+  function extractFileNamesFromText(value) {
+    const text = String(value || "").replace(/\s+/g, " ").trim();
+    if (!text) return [];
+    const matches = [];
+    FILE_NAME_IN_TEXT_RE.lastIndex = 0;
+    let m = null;
+    while ((m = FILE_NAME_IN_TEXT_RE.exec(text))) {
+      if (m[1]) matches.push(m[1]);
+      if (!m[0]) break;
+    }
+    FILE_NAME_IN_TEXT_RE.lastIndex = 0;
+    return dedupeStrings(matches.map((name) => sanitizeFileNameCandidate(name)).filter((name) => isLikelyFileName(name)));
+  }
+
+  function collectFileNameCandidates(source, out) {
+    if (!source) return;
+    if (isLikelyFileName(source)) {
+      out.push(sanitizeFileNameCandidate(source));
+      return;
+    }
+    const parsed = extractFileNamesFromText(source);
+    if (parsed.length) out.push(...parsed);
+  }
+
+  function extractUploadedFileNames(el) {
+    if (!el?.querySelectorAll) return [];
+    const nodes = el.querySelectorAll(ATTACHMENT_NODE_SELECTOR);
+    if (!nodes.length) return [];
+
+    const names = [];
+    nodes.forEach((node) => {
+      collectFileNameCandidates(node.getAttribute?.("download"), names);
+      collectFileNameCandidates(node.getAttribute?.("title"), names);
+      collectFileNameCandidates(node.getAttribute?.("aria-label"), names);
+      collectFileNameCandidates(node.textContent, names);
+    });
+    return dedupeStrings(names);
+  }
+
+  function bracketUploadedFileNames(text, fileNames) {
+    const names = dedupeStrings(fileNames);
+    if (!names.length) return (text || "").trim();
+    let out = String(text || "");
+    let replacedAny = false;
+    const sorted = names.slice().sort((a, b) => b.length - a.length);
+
+    for (const name of sorted) {
+      const bracketed = `[${name}]`;
+      if (out.includes(bracketed)) continue;
+      if (out.includes(name)) {
+        out = out.split(name).join(bracketed);
+        replacedAny = true;
+      }
+    }
+
+    if (!replacedAny) {
+      const prefix = names.map((name) => `[${name}]`).join(" ");
+      out = out ? `${prefix} ${out}` : prefix;
+    }
+
+    return out.replace(/\s+/g, " ").trim();
+  }
+
+  function bracketStandaloneFileTitle(title) {
+    const text = String(title || "").trim();
+    if (!text) return "";
+    if (/^\[[^\]]+\]$/.test(text)) return text;
+    if (!isLikelyFileName(text)) return text;
+    return `[${sanitizeFileNameCandidate(text)}]`;
+  }
+
+  function extractTextWithoutAttachmentNodes(el) {
+    if (!el?.querySelectorAll) return (el?.textContent || "").trim();
+    const clone = el.cloneNode(true);
+    clone.querySelectorAll(ATTACHMENT_NODE_SELECTOR).forEach((node) => node.remove());
+    return String(clone.textContent || "").replace(/\s+/g, " ").trim();
+  }
+
+  function stripFileArtifactsFromText(text, fileNames) {
+    let out = String(text || "");
+    const names = dedupeStrings(fileNames);
+    if (!names.length) return out.replace(/\s+/g, " ").trim();
+
+    const exts = [];
+    for (const name of names) {
+      const cleanName = sanitizeFileNameCandidate(name);
+      if (!cleanName) continue;
+      const dot = cleanName.lastIndexOf(".");
+      const ext = dot > 0 ? cleanName.slice(dot + 1) : "";
+      if (ext) exts.push(ext);
+      const escapedName = escapeRegExp(cleanName);
+      if (ext) {
+        const escapedExt = escapeRegExp(ext);
+        out = out.replace(new RegExp(`${escapedName}\\s*${escapedExt}(?=\\b|\\s|$)`, "gi"), "");
+      }
+      out = out.replace(new RegExp(escapedName, "gi"), "");
+    }
+
+    const uniqueExts = dedupeStrings(exts);
+    if (uniqueExts.length) {
+      const extPattern = uniqueExts.map((ext) => escapeRegExp(ext)).join("|");
+      out = out.replace(new RegExp(`\\b(?:${extPattern})\\b`, "gi"), "");
+      out = out.replace(new RegExp(`(^|\\s)(?:${extPattern})(?=[A-Za-z])`, "gi"), "$1");
+    }
+
+    return out.replace(/\s+/g, " ").trim();
+  }
+
+  function extractAttachmentLikeFileNamesFromText(textInput) {
+    const text = String(textInput || "").replace(/\s+/g, " ").trim();
+    if (!text) return [];
+    const candidates = extractFileNamesFromText(text);
+    if (!candidates.length) return [];
+
+    const out = [];
+    for (const name of candidates) {
+      const idx = text.toLowerCase().indexOf(name.toLowerCase());
+      if (idx < 0) continue;
+      const after = text.slice(idx + name.length);
+      const ext = name.includes(".") ? name.slice(name.lastIndexOf(".") + 1) : "";
+      const extBadgePattern = ext ? new RegExp(`^\\s*${escapeRegExp(ext)}\\b`, "i") : null;
+      const hasBadge = !!extBadgePattern?.test(after);
+      const hasGluedBadge = /^[A-Z]{2,}(?=[A-Za-z])/.test(after);
+      if (hasBadge || hasGluedBadge) out.push(name);
+    }
+    return dedupeStrings(out);
+  }
+
+  function extractAttachmentLikeFileNamesFromMessageText(el) {
+    return extractAttachmentLikeFileNamesFromText(el?.textContent || "");
+  }
+
+  function normalizeAttachmentArtifactsInTitle(title) {
+    const text = String(title || "").replace(/\s+/g, " ").trim();
+    if (!text) return "";
+    const files = extractAttachmentLikeFileNamesFromText(text);
+    if (!files.length) return text;
+    const cleanedPromptText = stripFileArtifactsFromText(text, files);
+    return bracketUploadedFileNames(cleanedPromptText, files) || text;
   }
 
   function safeAttrSelector(value) {
@@ -154,19 +404,24 @@
     return null;
   }
 
-  function extractUserText(el) {
-    // Try to get the direct textual content of the user message.
-    // Prefer text from paragraphs; otherwise innerText.
-    const txt = (el.textContent || "").trim();
-    return txt;
+  function extractUserText(el, uploadedFiles) {
+    const files = Array.isArray(uploadedFiles) ? uploadedFiles : extractUploadedFileNames(el);
+    const txtWithoutAttachments = extractTextWithoutAttachmentNodes(el);
+    if (!files.length) return txtWithoutAttachments;
+    const cleanedPromptText = stripFileArtifactsFromText(txtWithoutAttachments, files);
+    return bracketUploadedFileNames(cleanedPromptText, files);
   }
 
   function getCachedTitle(el) {
+    const uploadedFiles = dedupeStrings([
+      ...extractUploadedFileNames(el),
+      ...extractAttachmentLikeFileNamesFromMessageText(el)
+    ]);
+    const raw = extractUserText(el, uploadedFiles);
+    const baseTitle = textPreview(raw.split("\n").find(Boolean) || raw, 90);
+    const title = normalizeAttachmentArtifactsInTitle(bracketStandaloneFileTitle(baseTitle) || "[Media]");
     const cached = el.getAttribute?.(`data-${EXT_NS}-title`);
-    if (cached) return cached;
-    const raw = extractUserText(el);
-    const title = textPreview(raw.split("\n").find(Boolean) || raw, 90) || "[Media]";
-    el.setAttribute?.(`data-${EXT_NS}-title`, title);
+    if (cached !== title) el.setAttribute?.(`data-${EXT_NS}-title`, title);
     return title;
   }
 
@@ -184,7 +439,10 @@
 
   function ensureSidebar() {
     let sb = document.getElementById(SIDEBAR_ID);
-    if (sb) return sb;
+    if (sb) {
+      syncHiddenByDefaultToggle(sb);
+      return sb;
+    }
 
     sb = document.createElement("div");
     sb.id = SIDEBAR_ID;
@@ -194,7 +452,13 @@
     sb.innerHTML = `
       <div id="cgx-header">
         <div id="cgx-title-row">
-          <div id="cgx-title">${BOOKMARK_SVG}</div>
+          <label id="cgx-hidden-default-row" for="cgx-hidden-default">
+            <span>Hidden by Default</span>
+            <span class="cgx-switch">
+              <input type="checkbox" id="cgx-hidden-default" />
+              <span class="cgx-switch-track" aria-hidden="true"></span>
+            </span>
+          </label>
           <button class="cgx-btn cgx-icon-btn" id="cgx-hide" title="Hide sidebar (Alt+N to show again)" aria-label="Hide sidebar">
             ${MINUS_SVG}
           </button>
@@ -229,6 +493,12 @@
     // Collapse/Expand all
     sb.querySelector("#cgx-collapse-all").addEventListener("click", () => setAllAssistantCollapsed(true));
     sb.querySelector("#cgx-expand-all").addEventListener("click", () => setAllAssistantCollapsed(false));
+
+    const hiddenDefaultToggle = sb.querySelector("#cgx-hidden-default");
+    syncHiddenByDefaultToggle(sb);
+    hiddenDefaultToggle.addEventListener("change", () => {
+      setHiddenByDefault(hiddenDefaultToggle.checked);
+    });
 
     return sb;
   }
@@ -268,6 +538,11 @@
     ensureShowPill();
   }
 
+  function applySidebarDefaultVisibility() {
+    if (prefsCache.hiddenByDefault) hideSidebar();
+    else showSidebar();
+  }
+
   // ---------- Storage ----------
   async function loadState() {
     const key = getConversationKey();
@@ -281,6 +556,39 @@
     return new Promise((resolve) => {
       chrome.storage.local.set({ [key]: state }, () => resolve());
     });
+  }
+
+  function normalizePrefs(raw) {
+    const prefs = raw && typeof raw === "object" ? raw : {};
+    const hasHiddenByDefault = Object.prototype.hasOwnProperty.call(prefs, "hiddenByDefault");
+    const hasExpandByDefault = Object.prototype.hasOwnProperty.call(prefs, "expandByDefault");
+    const hiddenByDefault = hasHiddenByDefault ? !!prefs.hiddenByDefault : hasExpandByDefault ? !prefs.expandByDefault : false;
+    return {
+      hiddenByDefault
+    };
+  }
+
+  async function loadPrefs() {
+    return new Promise((resolve) => {
+      chrome.storage.local.get([PREFS_KEY], (res) => resolve(normalizePrefs(res[PREFS_KEY])));
+    });
+  }
+
+  async function savePrefs(prefs = prefsCache) {
+    const next = normalizePrefs(prefs);
+    return new Promise((resolve) => {
+      chrome.storage.local.set({ [PREFS_KEY]: next }, () => resolve());
+    });
+  }
+
+  async function setHiddenByDefault(value) {
+    prefsCache.hiddenByDefault = !!value;
+    await savePrefs(prefsCache);
+  }
+
+  function syncHiddenByDefaultToggle(root = document) {
+    const toggle = root.querySelector?.("#cgx-hidden-default");
+    if (toggle) toggle.checked = !!prefsCache.hiddenByDefault;
   }
 
   // ---------- Collapse logic ----------
@@ -425,15 +733,12 @@
   function renderList(indexItems, filterLower) {
     const sb = ensureSidebar();
     const list = sb.querySelector("#cgx-list");
-    const titleEl = sb.querySelector("#cgx-title");
     list.innerHTML = "";
 
     const items = (indexItems || []).filter((it) => {
       if (!filterLower) return true;
       return (it.title || "").toLowerCase().includes(filterLower);
     });
-
-    titleEl.innerHTML = BOOKMARK_SVG;
 
     if (!items.length) {
       const div = document.createElement("div");
@@ -626,6 +931,18 @@
   let mo = null;
   let observeTarget = null;
   let lastPath = "";
+  let routeEpoch = 0;
+
+  function clearScheduledScan() {
+    if (debounceTimer) {
+      clearTimeout(debounceTimer);
+      debounceTimer = null;
+    }
+    if (idleHandle && window.cancelIdleCallback) {
+      cancelIdleCallback(idleHandle);
+      idleHandle = null;
+    }
+  }
 
   function startObserver() {
     const nextTarget = document.querySelector("main") || document.body;
@@ -645,16 +962,21 @@
       mo = null;
     }
     observeTarget = null;
+    clearScheduledScan();
   }
 
-  async function activateForChat() {
-    stateCache = await loadState();
-    stateCache.collapsed = stateCache.collapsed || {};
+  async function activateForChat(epoch) {
     currentIndex = [];
     lastRenderedFilter = "";
     ensureSidebar();
-    await scanAndRender();
+    applySidebarDefaultVisibility();
     startObserver();
+
+    const loadedState = await loadState();
+    if (epoch !== routeEpoch || !isChatRoute()) return;
+    stateCache = loadedState || { collapsed: {} };
+    stateCache.collapsed = stateCache.collapsed || {};
+    await scanAndRender();
   }
 
   function deactivateForNonChat() {
@@ -667,13 +989,44 @@
   async function handleRouteChange() {
     const path = location.pathname || "";
     if (path === lastPath) return;
+    const epoch = ++routeEpoch;
     lastPath = path;
     if (isChatRoute(path)) {
       stopObserver();
-      await activateForChat();
+      await activateForChat(epoch);
     } else {
       deactivateForNonChat();
     }
+  }
+
+  function pathnameFromHref(href) {
+    if (!href) return null;
+    try {
+      const url = new URL(href, location.href);
+      if (url.origin !== location.origin) return null;
+      return url.pathname;
+    } catch {
+      return null;
+    }
+  }
+
+  function getNavIntentPath(event) {
+    if (!event || event.defaultPrevented) return null;
+    if (event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return null;
+    const anchor = event.target?.closest?.("a[href]");
+    if (!anchor) return null;
+    if (anchor.target && anchor.target !== "_self") return null;
+    return pathnameFromHref(anchor.getAttribute("href"));
+  }
+
+  function applyFastNavIntent(path) {
+    if (!path || path === location.pathname) return;
+    if (isChatRoute(path)) {
+      ensureSidebar();
+      applySidebarDefaultVisibility();
+      return;
+    }
+    deactivateForNonChat();
   }
 
   function installRouteListeners() {
@@ -689,10 +1042,24 @@
     if (history?.pushState) history.pushState = wrap(history.pushState);
     if (history?.replaceState) history.replaceState = wrap(history.replaceState);
     window.addEventListener("popstate", notify);
+    window.addEventListener("hashchange", notify);
+    if (window.navigation?.addEventListener) {
+      window.navigation.addEventListener("navigate", notify);
+    }
+    document.addEventListener(
+      "click",
+      (e) => {
+        const intentPath = getNavIntentPath(e);
+        if (!intentPath) return;
+        applyFastNavIntent(intentPath);
+      },
+      true
+    );
     window.addEventListener("cgx:locationchange", () => handleRouteChange());
   }
 
   async function init() {
+    prefsCache = await loadPrefs();
     installRouteListeners();
     await handleRouteChange();
     applyThemeFromDom();
@@ -707,7 +1074,7 @@
         attributeFilter: ["class", "data-theme", "data-color-mode", "data-color-scheme"]
       });
     }
-    setInterval(handleRouteChange, 4000);
+    setInterval(handleRouteChange, 800);
 
     window.addEventListener("keydown", (e) => {
       if (e.altKey && e.key.toLowerCase() === "n") {

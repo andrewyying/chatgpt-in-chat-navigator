@@ -165,13 +165,66 @@ body[class*="dark"] {
   gap: 8px;
 }
 
-#cgx-title {
-  font-weight: 700;
-  font-size: 13px;
-  color: var(--cgx-text);
-  display: flex;
+#cgx-hidden-default-row {
+  display: inline-flex;
   align-items: center;
-  gap: 8px;
+  gap: 10px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--cgx-text);
+  cursor: pointer;
+  user-select: none;
+}
+
+#cgx-hidden-default-row .cgx-switch {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+}
+
+#cgx-hidden-default {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  opacity: 0;
+  margin: 0;
+  cursor: pointer;
+}
+
+.cgx-switch-track {
+  width: 34px;
+  height: 20px;
+  border-radius: 999px;
+  border: 1px solid var(--cgx-border);
+  background: var(--cgx-btn-bg);
+  box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.08);
+  position: relative;
+  transition: background 140ms ease, border-color 140ms ease;
+}
+
+.cgx-switch-track::after {
+  content: "";
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 14px;
+  height: 14px;
+  border-radius: 999px;
+  background: var(--cgx-text);
+  opacity: 0.75;
+  transition: transform 140ms ease, opacity 140ms ease;
+}
+
+#cgx-hidden-default:checked + .cgx-switch-track {
+  background: var(--cgx-accent);
+  border-color: transparent;
+}
+
+#cgx-hidden-default:checked + .cgx-switch-track::after {
+  transform: translateX(14px);
+  background: var(--cgx-bg2);
+  opacity: 1;
 }
 
 

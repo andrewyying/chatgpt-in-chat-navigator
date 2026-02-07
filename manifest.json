@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
-  "name": "ChatGPT In-Chat Navigator",
-  "version": "0.1.0",
-  "description": "Helps you jump between your questions and fold long answers in ChatGPT.",
+  "name": "ChatGPT Navigator - Jump Between Questions, Fold Long Answers, Stay Focused",
+  "version": "0.1.1",
+  "description": "Jump between questions. Fold long answers. Stay focused.",
   "permissions": ["storage"],
   "host_permissions": ["https://chatgpt.com/*"],
   "content_scripts": [

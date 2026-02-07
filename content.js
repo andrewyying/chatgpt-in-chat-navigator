@@ -3,8 +3,10 @@
   const SIDEBAR_ID = "cgx-sidebar";
   const STORAGE_KEY_PREFIX = "cgx_state_v1";
   const PREFS_KEY = "cgx_prefs_v1";
+  const TITLE_CACHE_VERSION = "2";
   const DEBOUNCE_MS = 450;
   const IDLE_TIMEOUT_MS = 1200;
+  const ROUTE_POLL_MS = 2500;
   const MESSAGE_ROLE_SELECTOR = "[data-message-author-role]";
   const MESSAGE_ID_SELECTOR = "[data-message-id]";
   const TURN_SELECTOR = "article[data-testid^='conversation-turn-'], [data-turn-id]";
@@ -152,6 +154,7 @@
   function extractFileNamesFromText(value) {
     const text = String(value || "").replace(/\s+/g, " ").trim();
     if (!text) return [];
+    if (!text.includes(".")) return [];
     const matches = [];
     FILE_NAME_IN_TEXT_RE.lastIndex = 0;
     let m = null;
@@ -175,6 +178,7 @@
 
   function extractUploadedFileNames(el) {
     if (!el?.querySelectorAll) return [];
+    if (!el.querySelector?.(ATTACHMENT_NODE_SELECTOR)) return [];
     const nodes = el.querySelectorAll(ATTACHMENT_NODE_SELECTOR);
     if (!nodes.length) return [];
 
@@ -222,6 +226,7 @@
 
   function extractTextWithoutAttachmentNodes(el) {
     if (!el?.querySelectorAll) return (el?.textContent || "").trim();
+    if (!el.querySelector?.(ATTACHMENT_NODE_SELECTOR)) return String(el.textContent || "").replace(/\s+/g, " ").trim();
     const clone = el.cloneNode(true);
     clone.querySelectorAll(ATTACHMENT_NODE_SELECTOR).forEach((node) => node.remove());
     return String(clone.textContent || "").replace(/\s+/g, " ").trim();
@@ -263,9 +268,10 @@
     const candidates = extractFileNamesFromText(text);
     if (!candidates.length) return [];
 
+    const lower = text.toLowerCase();
     const out = [];
     for (const name of candidates) {
-      const idx = text.toLowerCase().indexOf(name.toLowerCase());
+      const idx = lower.indexOf(name.toLowerCase());
       if (idx < 0) continue;
       const after = text.slice(idx + name.length);
       const ext = name.includes(".") ? name.slice(name.lastIndexOf(".") + 1) : "";
@@ -288,6 +294,13 @@
     if (!files.length) return text;
     const cleanedPromptText = stripFileArtifactsFromText(text, files);
     return bracketUploadedFileNames(cleanedPromptText, files) || text;
+  }
+
+  function getTitleCacheKey(el) {
+    if (!el) return "0:0";
+    const hasAttachmentNodes = !!el.querySelector?.(ATTACHMENT_NODE_SELECTOR);
+    const childCount = typeof el.childElementCount === "number" ? el.childElementCount : 0;
+    return `${hasAttachmentNodes ? 1 : 0}:${childCount}`;
   }
 
   function safeAttrSelector(value) {
@@ -406,13 +419,19 @@
 
   function extractUserText(el, uploadedFiles) {
     const files = Array.isArray(uploadedFiles) ? uploadedFiles : extractUploadedFileNames(el);
+    if (!files.length) return String(el?.textContent || "").replace(/\s+/g, " ").trim();
     const txtWithoutAttachments = extractTextWithoutAttachmentNodes(el);
-    if (!files.length) return txtWithoutAttachments;
     const cleanedPromptText = stripFileArtifactsFromText(txtWithoutAttachments, files);
     return bracketUploadedFileNames(cleanedPromptText, files);
   }
 
   function getCachedTitle(el) {
+    const cached = el.getAttribute?.(`data-${EXT_NS}-title`);
+    const cachedVersion = el.getAttribute?.(`data-${EXT_NS}-title-ver`);
+    const cachedKey = el.getAttribute?.(`data-${EXT_NS}-title-key`);
+    const nextKey = getTitleCacheKey(el);
+    if (cached && cachedVersion === TITLE_CACHE_VERSION && cachedKey === nextKey) return cached;
+
     const uploadedFiles = dedupeStrings([
       ...extractUploadedFileNames(el),
       ...extractAttachmentLikeFileNamesFromMessageText(el)
@@ -420,8 +439,9 @@
     const raw = extractUserText(el, uploadedFiles);
     const baseTitle = textPreview(raw.split("\n").find(Boolean) || raw, 90);
     const title = normalizeAttachmentArtifactsInTitle(bracketStandaloneFileTitle(baseTitle) || "[Media]");
-    const cached = el.getAttribute?.(`data-${EXT_NS}-title`);
-    if (cached !== title) el.setAttribute?.(`data-${EXT_NS}-title`, title);
+    el.setAttribute?.(`data-${EXT_NS}-title`, title);
+    el.setAttribute?.(`data-${EXT_NS}-title-ver`, TITLE_CACHE_VERSION);
+    el.setAttribute?.(`data-${EXT_NS}-title-key`, nextKey);
     return title;
   }
 
@@ -1074,7 +1094,10 @@
         attributeFilter: ["class", "data-theme", "data-color-mode", "data-color-scheme"]
       });
     }
-    setInterval(handleRouteChange, 800);
+    setInterval(() => {
+      if (document.visibilityState === "hidden") return;
+      handleRouteChange();
+    }, ROUTE_POLL_MS);
 
     window.addEventListener("keydown", (e) => {
       if (e.altKey && e.key.toLowerCase() === "n") {

@@ -5,6 +5,7 @@
   const PREFS_KEY = "cgx_prefs_v1";
   const TITLE_CACHE_VERSION = "2";
   const DEBOUNCE_MS = 450;
+  const SEARCH_INPUT_DEBOUNCE_MS = 140;
   const IDLE_TIMEOUT_MS = 1200;
   const ROUTE_POLL_MS = 2500;
   const MESSAGE_ROLE_SELECTOR = "[data-message-author-role]";
@@ -103,6 +104,7 @@
     </svg>
   `;
   let prefsCache = { hiddenByDefault: false };
+  const titleCacheByElement = new WeakMap();
 
   // ---------- Utilities ----------
   function getConversationKey() {
@@ -296,13 +298,6 @@
     return bracketUploadedFileNames(cleanedPromptText, files) || text;
   }
 
-  function getTitleCacheKey(el) {
-    if (!el) return "0:0";
-    const hasAttachmentNodes = !!el.querySelector?.(ATTACHMENT_NODE_SELECTOR);
-    const childCount = typeof el.childElementCount === "number" ? el.childElementCount : 0;
-    return `${hasAttachmentNodes ? 1 : 0}:${childCount}`;
-  }
-
   function safeAttrSelector(value) {
     if (window.CSS && CSS.escape) return CSS.escape(value);
     return String(value).replace(/"/g, '\\"');
@@ -358,8 +353,20 @@
   function isLikelyMessageNode(node) {
     if (!node || (node.nodeType !== 1 && node.nodeType !== 11)) return false;
     const el = node;
-    if (el.matches?.(LIKELY_MESSAGE_SELECTOR)) return true;
-    return !!el.querySelector?.(LIKELY_MESSAGE_SELECTOR);
+    if (el.nodeType === 1) {
+      if (el.matches?.(LIKELY_MESSAGE_SELECTOR)) return true;
+      if (
+        el.hasAttribute?.("data-message-author-role") ||
+        el.hasAttribute?.("data-message-id") ||
+        el.hasAttribute?.("data-turn-id")
+      ) {
+        return true;
+      }
+      const dataTestId = el.getAttribute?.("data-testid");
+      if (typeof dataTestId === "string" && dataTestId.startsWith("conversation-turn-")) return true;
+    }
+    if (!el.querySelector) return false;
+    return !!(el.querySelector(MESSAGE_ROLE_SELECTOR) || el.querySelector(MESSAGE_ID_SELECTOR) || el.querySelector(TURN_SELECTOR));
   }
 
   function mutationHasMessageChange(records) {
@@ -374,6 +381,16 @@
         for (const node of m.removedNodes) {
           if (isLikelyMessageNode(node)) return true;
         }
+      }
+    }
+    return false;
+  }
+
+  function mutationHasMessageRemoval(records) {
+    for (const m of records) {
+      if (m.type !== "childList" || !m.removedNodes) continue;
+      for (const node of m.removedNodes) {
+        if (isLikelyMessageNode(node)) return true;
       }
     }
     return false;
@@ -426,11 +443,15 @@
   }
 
   function getCachedTitle(el) {
+    const memoTitle = titleCacheByElement.get(el);
+    if (memoTitle != null) return memoTitle;
+
     const cached = el.getAttribute?.(`data-${EXT_NS}-title`);
     const cachedVersion = el.getAttribute?.(`data-${EXT_NS}-title-ver`);
-    const cachedKey = el.getAttribute?.(`data-${EXT_NS}-title-key`);
-    const nextKey = getTitleCacheKey(el);
-    if (cached && cachedVersion === TITLE_CACHE_VERSION && cachedKey === nextKey) return cached;
+    if (cached && cachedVersion === TITLE_CACHE_VERSION) {
+      titleCacheByElement.set(el, cached);
+      return cached;
+    }
 
     const uploadedFiles = dedupeStrings([
       ...extractUploadedFileNames(el),
@@ -441,7 +462,7 @@
     const title = normalizeAttachmentArtifactsInTitle(bracketStandaloneFileTitle(baseTitle) || "[Media]");
     el.setAttribute?.(`data-${EXT_NS}-title`, title);
     el.setAttribute?.(`data-${EXT_NS}-title-ver`, TITLE_CACHE_VERSION);
-    el.setAttribute?.(`data-${EXT_NS}-title-key`, nextKey);
+    titleCacheByElement.set(el, title);
     return title;
   }
 
@@ -459,10 +480,7 @@
 
   function ensureSidebar() {
     let sb = document.getElementById(SIDEBAR_ID);
-    if (sb) {
-      syncHiddenByDefaultToggle(sb);
-      return sb;
-    }
+    if (sb) return sb;
 
     sb = document.createElement("div");
     sb.id = SIDEBAR_ID;
@@ -501,14 +519,11 @@
 
     // Search filter
     const search = sb.querySelector("#cgx-search");
-    search.addEventListener("input", () => {
-      const q = (search.value || "").trim().toLowerCase();
-      renderList(currentIndex, q);
-      lastRenderedFilter = q;
-    });
+    search.addEventListener("input", scheduleSearchRender);
+    sb.querySelector("#cgx-list").addEventListener("click", onListClick);
 
     // Refresh
-    sb.querySelector("#cgx-refresh").addEventListener("click", () => scanAndRender());
+    sb.querySelector("#cgx-refresh").addEventListener("click", () => scanAndRender({ force: true }));
 
     // Collapse/Expand all
     sb.querySelector("#cgx-collapse-all").addEventListener("click", () => setAllAssistantCollapsed(true));
@@ -710,14 +725,14 @@
   }
 
   async function setAllAssistantCollapsed(value) {
-    const blocks = findAllMessageBlocks();
+    const roleNodes = getRoleNodesFast();
+    const blocks = roleNodes ? Array.from(roleNodes.assistantNodes) : findAllMessageBlocks();
     let changed = false;
 
     for (let i = 0; i < blocks.length; i++) {
       const el = blocks[i];
-      const role = getRole(el);
       if (isComposerArea(el)) continue;
-      if (role !== "assistant") continue;
+      if (!roleNodes && getRole(el) !== "assistant") continue;
       const id = stableIdForElement(el, i);
       if (value && !isCollapsed(id)) {
         stateCache.collapsed[id] = true;
@@ -739,7 +754,93 @@
 
   // ---------- Sidebar index ----------
   let currentIndex = []; // {id, el, title, idx}
+  let currentIndexById = new Map();
   let lastRenderedFilter = "";
+  let lastUserSignature = "";
+  let lastAssistantSignature = "";
+  let forceFullScan = true;
+  let searchRenderTimer = null;
+
+  function setCurrentIndex(nextIndex) {
+    currentIndex = nextIndex;
+    currentIndexById = new Map();
+    for (const item of nextIndex || []) {
+      currentIndexById.set(item.id, item);
+    }
+  }
+
+  function resetScanState() {
+    lastUserSignature = "";
+    lastAssistantSignature = "";
+    forceFullScan = true;
+  }
+
+  function clearSearchRenderTimer() {
+    if (!searchRenderTimer) return;
+    clearTimeout(searchRenderTimer);
+    searchRenderTimer = null;
+  }
+
+  function getSidebarFilterValue(root = document.getElementById(SIDEBAR_ID)) {
+    const input = root?.querySelector?.("#cgx-search");
+    return (input?.value || "").trim().toLowerCase();
+  }
+
+  function scheduleSearchRender() {
+    clearSearchRenderTimer();
+    searchRenderTimer = setTimeout(() => {
+      searchRenderTimer = null;
+      const q = getSidebarFilterValue();
+      if (q === lastRenderedFilter) return;
+      renderList(currentIndex, q);
+      lastRenderedFilter = q;
+    }, SEARCH_INPUT_DEBOUNCE_MS);
+  }
+
+  function findNextAssistantForUser(userEl) {
+    const blocks = findAllMessageBlocks();
+    const idx = blocks.indexOf(userEl);
+    if (idx < 0) return null;
+    const next = blocks[idx + 1];
+    if (!next) return null;
+    return getRole(next) === "assistant" ? next : null;
+  }
+
+  function handleIndexItemClick(it) {
+    if (!it) return;
+    if (!it.el || !document.contains(it.el)) {
+      scanAndRender({ force: true });
+      return;
+    }
+    it.el.scrollIntoView({ behavior: "smooth", block: "start" });
+    it.el.classList.remove("cgx-highlight");
+    void it.el.offsetWidth;
+    it.el.classList.add("cgx-highlight");
+    setTimeout(() => it.el?.classList?.remove("cgx-highlight"), 1300);
+
+    const next = findNextAssistantForUser(it.el);
+    if (!next) return;
+    const nextId = next.getAttribute?.(`data-${EXT_NS}-id`);
+    if (!nextId || !isCollapsed(nextId)) return;
+    stateCache.collapsed = stateCache.collapsed || {};
+    delete stateCache.collapsed[nextId];
+    saveState(stateCache);
+    const content = findAssistantContentContainer(next);
+    content?.classList?.remove("cgx-collapsed");
+    const toggleBtn = next.querySelector?.(`.${EXT_NS}-toggle`);
+    if (!toggleBtn) return;
+    toggleBtn.innerHTML = COLLAPSE_SVG;
+    toggleBtn.setAttribute("aria-label", "Collapse");
+    toggleBtn.setAttribute("title", "Collapse");
+  }
+
+  function onListClick(event) {
+    const card = event?.target?.closest?.(".cgx-item[data-cgx-id]");
+    if (!card) return;
+    const itemId = card.getAttribute("data-cgx-id");
+    if (!itemId) return;
+    handleIndexItemClick(currentIndexById.get(itemId));
+  }
 
   function isSameIndex(prev, next) {
     if (prev.length !== next.length) return false;
@@ -757,6 +858,7 @@
 
     const items = (indexItems || []).filter((it) => {
       if (!filterLower) return true;
+      if (typeof it.titleLower === "string") return it.titleLower.includes(filterLower);
       return (it.title || "").toLowerCase().includes(filterLower);
     });
 
@@ -783,39 +885,7 @@
       q.className = "q";
       q.textContent = it.title || "";
       card.append(meta, q);
-      card.addEventListener("click", () => {
-        if (!it.el || !document.contains(it.el)) {
-          scanAndRender();
-          return;
-        }
-        it.el.scrollIntoView({ behavior: "smooth", block: "start" });
-        it.el.classList.remove("cgx-highlight");
-        void it.el.offsetWidth;
-        it.el.classList.add("cgx-highlight");
-        setTimeout(() => it.el?.classList?.remove("cgx-highlight"), 1300);
-
-        const blocks = findAllMessageBlocks();
-        const idx = blocks.indexOf(it.el);
-        if (idx >= 0 && blocks[idx + 1]) {
-          const next = blocks[idx + 1];
-          if (getRole(next) === "assistant") {
-            const nextId = next.getAttribute?.(`data-${EXT_NS}-id`);
-            if (nextId && isCollapsed(nextId)) {
-              stateCache.collapsed = stateCache.collapsed || {};
-              delete stateCache.collapsed[nextId];
-              saveState(stateCache);
-              const content = findAssistantContentContainer(next);
-              content?.classList?.remove("cgx-collapsed");
-              const toggleBtn = next.querySelector?.(`.${EXT_NS}-toggle`);
-              if (toggleBtn) {
-                toggleBtn.innerHTML = COLLAPSE_SVG;
-                toggleBtn.setAttribute("aria-label", "Collapse");
-                toggleBtn.setAttribute("title", "Collapse");
-              }
-            }
-          }
-        }
-      });
+      card.setAttribute("data-cgx-id", it.id);
       fragment.appendChild(card);
     }
     list.appendChild(fragment);
@@ -828,10 +898,27 @@
     return { userNodes, assistantNodes };
   }
 
-  function scanIndexFast(userNodes, assistantNodes) {
-    const index = [];
-    let userCount = 0;
+  function getRoleNodeSignaturePart(node, idx) {
+    if (!node) return `i${idx}`;
+    return (
+      node.getAttribute?.("data-message-id") ||
+      node.getAttribute?.("data-turn-id") ||
+      node.getAttribute?.(`data-${EXT_NS}-id`) ||
+      node.id ||
+      `i${idx}`
+    );
+  }
 
+  function buildRoleNodeSignature(nodes) {
+    const len = nodes?.length || 0;
+    if (!len) return "0";
+    if (len === 1) return `1:${getRoleNodeSignaturePart(nodes[0], 0)}`;
+    if (len === 2) return `2:${getRoleNodeSignaturePart(nodes[0], 0)}|${getRoleNodeSignaturePart(nodes[1], 1)}`;
+    const mid = Math.floor((len - 1) / 2);
+    return `${len}:${getRoleNodeSignaturePart(nodes[0], 0)}|${getRoleNodeSignaturePart(nodes[mid], mid)}|${getRoleNodeSignaturePart(nodes[len - 1], len - 1)}`;
+  }
+
+  function syncAssistantTogglesFast(assistantNodes) {
     for (let i = 0; i < assistantNodes.length; i++) {
       const el = assistantNodes[i];
       if (isComposerArea(el)) continue;
@@ -841,17 +928,23 @@
         injectToggleForAssistant(el, id);
       }
     }
+  }
+
+  function buildUserIndexFast(userNodes) {
+    const index = [];
+    let userCount = 0;
 
     for (let i = 0; i < userNodes.length; i++) {
       const el = userNodes[i];
       if (isComposerArea(el)) continue;
       userCount++;
       const id = stableIdForElement(el, i);
-      const title = getCachedTitle(el);
+      const title = getCachedTitle(el) || "[Media]";
       index.push({
         id,
         el,
-        title: title || "[Media]",
+        title,
+        titleLower: title.toLowerCase(),
         idx: userCount,
         anchorHint: ""
       });
@@ -888,6 +981,7 @@
         id,
         el,
         title: title || "[Media]",
+        titleLower: (title || "[Media]").toLowerCase(),
         idx: userCount,
         anchorHint: ""
       });
@@ -902,23 +996,53 @@
     return index;
   }
 
-  function scanIndex() {
-    const roleNodes = getRoleNodesFast();
-    if (roleNodes) return scanIndexFast(roleNodes.userNodes, roleNodes.assistantNodes);
-    return scanIndexFallback();
-  }
-
-  async function scanAndRender() {
+  async function scanAndRender(options = {}) {
     if (!isChatRoute()) return;
-    const nextIndex = scanIndex();
-    const changed = !isSameIndex(currentIndex, nextIndex);
-    currentIndex = nextIndex;
+    if (options.force) forceFullScan = true;
+
     const sb = ensureSidebar();
-    const q = (sb.querySelector("#cgx-search").value || "").trim().toLowerCase();
-    if (changed || q !== lastRenderedFilter) {
+    const q = getSidebarFilterValue(sb);
+    const roleNodes = getRoleNodesFast();
+
+    if (roleNodes) {
+      const userSignature = buildRoleNodeSignature(roleNodes.userNodes);
+      const assistantSignature = buildRoleNodeSignature(roleNodes.assistantNodes);
+      const userChanged = forceFullScan || userSignature !== lastUserSignature;
+      const assistantChanged = forceFullScan || assistantSignature !== lastAssistantSignature;
+
+      if (assistantChanged) {
+        syncAssistantTogglesFast(roleNodes.assistantNodes);
+      }
+
+      if (userChanged) {
+        const nextIndex = buildUserIndexFast(roleNodes.userNodes);
+        const changed = !isSameIndex(currentIndex, nextIndex);
+        setCurrentIndex(nextIndex);
+        if (changed || q !== lastRenderedFilter || forceFullScan) {
+          renderList(currentIndex, q);
+          lastRenderedFilter = q;
+        }
+      } else if (q !== lastRenderedFilter || forceFullScan) {
+        renderList(currentIndex, q);
+        lastRenderedFilter = q;
+      }
+
+      lastUserSignature = userSignature;
+      lastAssistantSignature = assistantSignature;
+      forceFullScan = false;
+      return;
+    }
+
+    const nextIndex = scanIndexFallback();
+    const changed = !isSameIndex(currentIndex, nextIndex);
+    setCurrentIndex(nextIndex);
+    if (changed || q !== lastRenderedFilter || forceFullScan) {
       renderList(currentIndex, q);
       lastRenderedFilter = q;
     }
+    lastUserSignature = "";
+    lastAssistantSignature = "";
+    forceFullScan = false;
   }
 
   // ---------- Observe & init ----------
@@ -971,6 +1095,7 @@
     observeTarget = nextTarget;
     mo = new MutationObserver((records) => {
       if (!mutationHasMessageChange(records)) return;
+      if (mutationHasMessageRemoval(records)) forceFullScan = true;
       scheduleScan();
     });
     mo.observe(observeTarget, { childList: true, subtree: true });
@@ -986,8 +1111,10 @@
   }
 
   async function activateForChat(epoch) {
-    currentIndex = [];
+    setCurrentIndex([]);
     lastRenderedFilter = "";
+    clearSearchRenderTimer();
+    resetScanState();
     ensureSidebar();
     applySidebarDefaultVisibility();
     startObserver();
@@ -1002,8 +1129,10 @@
   function deactivateForNonChat() {
     stopObserver();
     removeInjectedUI();
-    currentIndex = [];
+    setCurrentIndex([]);
     lastRenderedFilter = "";
+    clearSearchRenderTimer();
+    resetScanState();
   }
 
   async function handleRouteChange() {

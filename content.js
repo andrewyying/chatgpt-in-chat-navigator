@@ -341,7 +341,7 @@
   }
 
   function isChatRoute(pathname = location.pathname) {
-    return /^\/c\/[^/]+/.test(pathname);
+    return /\/c\/[^/]+/.test(pathname);
   }
 
   function removeInjectedUI() {

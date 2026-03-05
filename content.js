@@ -7,11 +7,10 @@
   const DEBOUNCE_MS = 450;
   const SEARCH_INPUT_DEBOUNCE_MS = 140;
   const IDLE_TIMEOUT_MS = 1200;
-  const ROUTE_POLL_MS = 2500;
+  const ROUTE_POLL_MS = 5000;
   const MESSAGE_ROLE_SELECTOR = "[data-message-author-role]";
   const MESSAGE_ID_SELECTOR = "[data-message-id]";
   const TURN_SELECTOR = "article[data-testid^='conversation-turn-'], [data-turn-id]";
-  const LIKELY_MESSAGE_SELECTOR = `${MESSAGE_ROLE_SELECTOR}, ${MESSAGE_ID_SELECTOR}, ${TURN_SELECTOR}`;
   const ATTACHMENT_NODE_SELECTOR = [
     "a[download]",
     "a[href*='/files/']",
@@ -105,6 +104,30 @@
   `;
   let prefsCache = { hiddenByDefault: false };
   const titleCacheByElement = new WeakMap();
+  const regexCache = new Map();
+
+  const svgTemplateContainer = document.createElement("div");
+  function parseSvgTemplate(html) {
+    svgTemplateContainer.innerHTML = html;
+    return svgTemplateContainer.firstElementChild;
+  }
+  const EXPAND_SVG_TMPL = parseSvgTemplate(EXPAND_SVG);
+  const COLLAPSE_SVG_TMPL = parseSvgTemplate(COLLAPSE_SVG);
+  const BOOKMARK_SVG_TMPL = parseSvgTemplate(BOOKMARK_SVG);
+  const MINUS_SVG_TMPL = parseSvgTemplate(MINUS_SVG);
+
+  function setToggleIcon(btn, collapsed) {
+    const tmpl = collapsed ? EXPAND_SVG_TMPL : COLLAPSE_SVG_TMPL;
+    const existing = btn.firstElementChild;
+    if (existing?.getAttribute?.("viewBox") === tmpl.getAttribute("viewBox")) {
+      const path = existing.querySelector("path, rect");
+      const tmplPath = tmpl.querySelector("path, rect");
+      if (path && tmplPath && path.getAttribute("d") === tmplPath.getAttribute("d")) return;
+    }
+    btn.replaceChildren(tmpl.cloneNode(true));
+    btn.setAttribute("aria-label", collapsed ? "Expand" : "Collapse");
+    btn.setAttribute("title", collapsed ? "Expand" : "Collapse");
+  }
 
   // ---------- Utilities ----------
   function getConversationKey() {
@@ -229,9 +252,36 @@
   function extractTextWithoutAttachmentNodes(el) {
     if (!el?.querySelectorAll) return (el?.textContent || "").trim();
     if (!el.querySelector?.(ATTACHMENT_NODE_SELECTOR)) return String(el.textContent || "").replace(/\s+/g, " ").trim();
-    const clone = el.cloneNode(true);
-    clone.querySelectorAll(ATTACHMENT_NODE_SELECTOR).forEach((node) => node.remove());
-    return String(clone.textContent || "").replace(/\s+/g, " ").trim();
+    const attachmentNodes = el.querySelectorAll(ATTACHMENT_NODE_SELECTOR);
+    const skipSet = new Set(attachmentNodes);
+    const parts = [];
+    const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT, {
+      acceptNode(node) {
+        let parent = node.parentNode;
+        while (parent && parent !== el) {
+          if (skipSet.has(parent)) return NodeFilter.FILTER_REJECT;
+          parent = parent.parentNode;
+        }
+        return NodeFilter.FILTER_ACCEPT;
+      }
+    });
+    while (walker.nextNode()) {
+      const v = walker.currentNode.nodeValue;
+      if (v) parts.push(v);
+    }
+    return parts.join(" ").replace(/\s+/g, " ").trim();
+  }
+
+  function getCachedRegex(pattern, flags) {
+    const key = `${flags}:${pattern}`;
+    let re = regexCache.get(key);
+    if (!re) {
+      re = new RegExp(pattern, flags);
+      if (regexCache.size > 200) regexCache.clear();
+      regexCache.set(key, re);
+    }
+    re.lastIndex = 0;
+    return re;
   }
 
   function stripFileArtifactsFromText(text, fileNames) {
@@ -249,16 +299,16 @@
       const escapedName = escapeRegExp(cleanName);
       if (ext) {
         const escapedExt = escapeRegExp(ext);
-        out = out.replace(new RegExp(`${escapedName}\\s*${escapedExt}(?=\\b|\\s|$)`, "gi"), "");
+        out = out.replace(getCachedRegex(`${escapedName}\\s*${escapedExt}(?=\\b|\\s|$)`, "gi"), "");
       }
-      out = out.replace(new RegExp(escapedName, "gi"), "");
+      out = out.replace(getCachedRegex(escapedName, "gi"), "");
     }
 
     const uniqueExts = dedupeStrings(exts);
     if (uniqueExts.length) {
       const extPattern = uniqueExts.map((ext) => escapeRegExp(ext)).join("|");
-      out = out.replace(new RegExp(`\\b(?:${extPattern})\\b`, "gi"), "");
-      out = out.replace(new RegExp(`(^|\\s)(?:${extPattern})(?=[A-Za-z])`, "gi"), "$1");
+      out = out.replace(getCachedRegex(`\\b(?:${extPattern})\\b`, "gi"), "");
+      out = out.replace(getCachedRegex(`(^|\\s)(?:${extPattern})(?=[A-Za-z])`, "gi"), "$1");
     }
 
     return out.replace(/\s+/g, " ").trim();
@@ -277,8 +327,7 @@
       if (idx < 0) continue;
       const after = text.slice(idx + name.length);
       const ext = name.includes(".") ? name.slice(name.lastIndexOf(".") + 1) : "";
-      const extBadgePattern = ext ? new RegExp(`^\\s*${escapeRegExp(ext)}\\b`, "i") : null;
-      const hasBadge = !!extBadgePattern?.test(after);
+      const hasBadge = ext ? getCachedRegex(`^\\s*${escapeRegExp(ext)}\\b`, "i").test(after) : false;
       const hasGluedBadge = /^[A-Z]{2,}(?=[A-Za-z])/.test(after);
       if (hasBadge || hasGluedBadge) out.push(name);
     }
@@ -305,13 +354,17 @@
 
   function isElementVisible(el) {
     if (!el) return false;
-    const rect = el.getBoundingClientRect();
-    return rect.width > 0 && rect.height > 0;
+    return el.offsetWidth > 0 || el.offsetHeight > 0;
   }
 
+  const composerCache = new WeakMap();
   function isComposerArea(el) {
     if (!el || !el.querySelector) return false;
-    return !!el.querySelector("textarea, [contenteditable='true'], [data-testid*='prompt']");
+    const cached = composerCache.get(el);
+    if (cached !== undefined) return cached;
+    const result = !!el.querySelector("textarea, [contenteditable='true'], [data-testid*='prompt']");
+    composerCache.set(el, result);
+    return result;
   }
 
   function detectThemeFromDom() {
@@ -351,57 +404,63 @@
   }
 
   function isLikelyMessageNode(node) {
-    if (!node || (node.nodeType !== 1 && node.nodeType !== 11)) return false;
-    const el = node;
-    if (el.nodeType === 1) {
-      if (el.matches?.(LIKELY_MESSAGE_SELECTOR)) return true;
-      if (
-        el.hasAttribute?.("data-message-author-role") ||
-        el.hasAttribute?.("data-message-id") ||
-        el.hasAttribute?.("data-turn-id")
-      ) {
-        return true;
-      }
-      const dataTestId = el.getAttribute?.("data-testid");
-      if (typeof dataTestId === "string" && dataTestId.startsWith("conversation-turn-")) return true;
+    if (!node || node.nodeType !== 1) return false;
+    if (
+      node.hasAttribute("data-message-author-role") ||
+      node.hasAttribute("data-message-id") ||
+      node.hasAttribute("data-turn-id")
+    ) {
+      return true;
     }
-    if (!el.querySelector) return false;
-    return !!(el.querySelector(MESSAGE_ROLE_SELECTOR) || el.querySelector(MESSAGE_ID_SELECTOR) || el.querySelector(TURN_SELECTOR));
+    const dataTestId = node.getAttribute("data-testid");
+    if (typeof dataTestId === "string" && dataTestId.startsWith("conversation-turn-")) return true;
+    if (node.tagName === "ARTICLE" && dataTestId) return true;
+    return false;
   }
 
-  function mutationHasMessageChange(records) {
+  function subtreeHasMessageNode(node) {
+    if (!node || !node.querySelector) return false;
+    return !!(
+      node.querySelector(MESSAGE_ROLE_SELECTOR) ||
+      node.querySelector(MESSAGE_ID_SELECTOR) ||
+      node.querySelector(TURN_SELECTOR)
+    );
+  }
+
+  function nodeIsOrContainsMessage(node) {
+    if (isLikelyMessageNode(node)) return true;
+    if (node.nodeType === 1 && node.childElementCount > 0) return subtreeHasMessageNode(node);
+    return false;
+  }
+
+  function classifyMutations(records) {
+    let hasChange = false;
+    let hasRemoval = false;
     for (const m of records) {
       if (m.type !== "childList") continue;
-      if (m.addedNodes) {
+      if (!hasChange && m.addedNodes) {
         for (const node of m.addedNodes) {
-          if (isLikelyMessageNode(node)) return true;
+          if (nodeIsOrContainsMessage(node)) { hasChange = true; break; }
         }
       }
       if (m.removedNodes) {
         for (const node of m.removedNodes) {
-          if (isLikelyMessageNode(node)) return true;
+          if (nodeIsOrContainsMessage(node)) {
+            hasChange = true;
+            hasRemoval = true;
+            break;
+          }
         }
       }
+      if (hasChange && hasRemoval) break;
     }
-    return false;
+    return { hasChange, hasRemoval };
   }
 
-  function mutationHasMessageRemoval(records) {
-    for (const m of records) {
-      if (m.type !== "childList" || !m.removedNodes) continue;
-      for (const node of m.removedNodes) {
-        if (isLikelyMessageNode(node)) return true;
-      }
-    }
-    return false;
-  }
-
-  // Find message blocks: prefer role attribute, then article/group wrappers.
   function findAllMessageBlocks() {
     const roleNodes = document.querySelectorAll(MESSAGE_ROLE_SELECTOR);
     if (roleNodes?.length) return Array.from(roleNodes);
 
-    // Alternative: ChatGPT sometimes wraps turns in articles; prefer turn/message IDs.
     const turns = document.querySelectorAll(`main ${TURN_SELECTOR}, main ${MESSAGE_ID_SELECTOR}`);
     if (turns?.length) return Array.from(turns);
 
@@ -413,8 +472,7 @@
       if (txt.length < 5) continue;
       const pCount = el.querySelectorAll("p").length;
       if (pCount === 0 && txt.length < 40) continue;
-      const rect = el.getBoundingClientRect();
-      if (rect.height < 20) continue;
+      if (el.offsetHeight < 20) continue;
       blocks.push(el);
     }
     return blocks;
@@ -586,7 +644,17 @@
     });
   }
 
-  async function saveState(state) {
+  let saveStateTimer = null;
+  function saveState(state) {
+    if (saveStateTimer) clearTimeout(saveStateTimer);
+    saveStateTimer = setTimeout(() => {
+      saveStateTimer = null;
+      const key = getConversationKey();
+      chrome.storage.local.set({ [key]: state });
+    }, 300);
+  }
+  function saveStateNow(state) {
+    if (saveStateTimer) { clearTimeout(saveStateTimer); saveStateTimer = null; }
     const key = getConversationKey();
     return new Promise((resolve) => {
       chrome.storage.local.set({ [key]: state }, () => resolve());
@@ -691,11 +759,8 @@
 
     const apply = () => {
       const collapsed = isCollapsed(messageId);
-      if (collapsed) content.classList.add("cgx-collapsed");
-      else content.classList.remove("cgx-collapsed");
-      btn.innerHTML = collapsed ? EXPAND_SVG : COLLAPSE_SVG;
-      btn.setAttribute("aria-label", collapsed ? "Expand" : "Collapse");
-      btn.setAttribute("title", collapsed ? "Expand" : "Collapse");
+      content.classList.toggle("cgx-collapsed", collapsed);
+      setToggleIcon(btn, collapsed);
     };
 
     btn.dataset.cgxTarget = messageId;
@@ -712,11 +777,8 @@
         if (!targetContent) return;
         const next = !isCollapsed(targetId);
         setCollapsed(targetId, next);
-        if (next) targetContent.classList.add("cgx-collapsed");
-        else targetContent.classList.remove("cgx-collapsed");
-        btn.innerHTML = next ? EXPAND_SVG : COLLAPSE_SVG;
-        btn.setAttribute("aria-label", next ? "Expand" : "Collapse");
-        btn.setAttribute("title", next ? "Expand" : "Collapse");
+        targetContent.classList.toggle("cgx-collapsed", next);
+        setToggleIcon(btn, next);
       });
     }
 
@@ -729,27 +791,27 @@
     const blocks = roleNodes ? Array.from(roleNodes.assistantNodes) : findAllMessageBlocks();
     let changed = false;
 
-    for (let i = 0; i < blocks.length; i++) {
-      const el = blocks[i];
-      if (isComposerArea(el)) continue;
-      if (!roleNodes && getRole(el) !== "assistant") continue;
-      const id = stableIdForElement(el, i);
-      if (value && !isCollapsed(id)) {
-        stateCache.collapsed[id] = true;
-        changed = true;
-      } else if (!value && isCollapsed(id)) {
-        delete stateCache.collapsed[id];
-        changed = true;
+    pauseObserver();
+    try {
+      for (let i = 0; i < blocks.length; i++) {
+        const el = blocks[i];
+        if (isComposerArea(el)) continue;
+        if (!roleNodes && getRole(el) !== "assistant") continue;
+        const id = stableIdForElement(el, i);
+        if (value && !isCollapsed(id)) {
+          stateCache.collapsed[id] = true;
+          changed = true;
+        } else if (!value && isCollapsed(id)) {
+          delete stateCache.collapsed[id];
+          changed = true;
+        }
+        injectToggleForAssistant(el, id);
       }
-      // Apply immediately
-      injectToggleForAssistant(el, id);
-      const content = findAssistantContentContainer(el);
-      if (!content) continue;
-      if (value) content.classList.add("cgx-collapsed");
-      else content.classList.remove("cgx-collapsed");
+    } finally {
+      resumeObserver();
     }
 
-    if (changed) await saveState(stateCache);
+    if (changed) await saveStateNow(stateCache);
   }
 
   // ---------- Sidebar index ----------
@@ -773,6 +835,7 @@
     lastUserSignature = "";
     lastAssistantSignature = "";
     forceFullScan = true;
+    regexCache.clear();
   }
 
   function clearSearchRenderTimer() {
@@ -798,6 +861,20 @@
   }
 
   function findNextAssistantForUser(userEl) {
+    if (!userEl) return null;
+    const roleAttr = userEl.getAttribute("data-message-author-role");
+    if (roleAttr === "user") {
+      const parent = userEl.parentElement;
+      if (parent) {
+        let sibling = parent.nextElementSibling;
+        while (sibling) {
+          const assistantEl = sibling.querySelector?.("[data-message-author-role='assistant']");
+          if (assistantEl) return assistantEl;
+          if (sibling.getAttribute?.("data-message-author-role") === "assistant") return sibling;
+          break;
+        }
+      }
+    }
     const blocks = findAllMessageBlocks();
     const idx = blocks.indexOf(userEl);
     if (idx < 0) return null;
@@ -829,9 +906,7 @@
     content?.classList?.remove("cgx-collapsed");
     const toggleBtn = next.querySelector?.(`.${EXT_NS}-toggle`);
     if (!toggleBtn) return;
-    toggleBtn.innerHTML = COLLAPSE_SVG;
-    toggleBtn.setAttribute("aria-label", "Collapse");
-    toggleBtn.setAttribute("title", "Collapse");
+    setToggleIcon(toggleBtn, false);
   }
 
   function onListClick(event) {
@@ -854,7 +929,6 @@
   function renderList(indexItems, filterLower) {
     const sb = ensureSidebar();
     const list = sb.querySelector("#cgx-list");
-    list.innerHTML = "";
 
     const items = (indexItems || []).filter((it) => {
       if (!filterLower) return true;
@@ -863,6 +937,8 @@
     });
 
     if (!items.length) {
+      if (list.childElementCount === 1 && list.firstElementChild?.classList?.contains("cgx-muted")) return;
+      list.innerHTML = "";
       const div = document.createElement("div");
       div.className = "cgx-muted";
       div.textContent = "No questions found.";
@@ -870,24 +946,44 @@
       return;
     }
 
+    const existing = list.querySelectorAll(".cgx-item[data-cgx-id]");
+    const existingById = new Map();
+    for (const el of existing) existingById.set(el.getAttribute("data-cgx-id"), el);
+
+    const muted = list.querySelector(".cgx-muted");
+    if (muted) muted.remove();
+
     const fragment = document.createDocumentFragment();
     for (const it of items) {
-      const card = document.createElement("div");
-      card.className = "cgx-item";
-      const meta = document.createElement("div");
-      meta.className = "meta";
-      const spanIdx = document.createElement("span");
-      spanIdx.textContent = `#${it.idx}`;
-      const spanHint = document.createElement("span");
-      spanHint.textContent = it.anchorHint || "";
-      meta.append(spanIdx, spanHint);
-      const q = document.createElement("div");
-      q.className = "q";
-      q.textContent = it.title || "";
-      card.append(meta, q);
-      card.setAttribute("data-cgx-id", it.id);
+      let card = existingById.get(it.id);
+      if (card) {
+        existingById.delete(it.id);
+        const qEl = card.querySelector(".q");
+        if (qEl && qEl.textContent !== (it.title || "")) qEl.textContent = it.title || "";
+        const metaSpans = card.querySelectorAll(".meta span");
+        if (metaSpans[0]) {
+          const idxText = `#${it.idx}`;
+          if (metaSpans[0].textContent !== idxText) metaSpans[0].textContent = idxText;
+        }
+      } else {
+        card = document.createElement("div");
+        card.className = "cgx-item";
+        const meta = document.createElement("div");
+        meta.className = "meta";
+        const spanIdx = document.createElement("span");
+        spanIdx.textContent = `#${it.idx}`;
+        const spanHint = document.createElement("span");
+        spanHint.textContent = it.anchorHint || "";
+        meta.append(spanIdx, spanHint);
+        const q = document.createElement("div");
+        q.className = "q";
+        q.textContent = it.title || "";
+        card.append(meta, q);
+        card.setAttribute("data-cgx-id", it.id);
+      }
       fragment.appendChild(card);
     }
+    for (const stale of existingById.values()) stale.remove();
     list.appendChild(fragment);
   }
 
@@ -1004,45 +1100,50 @@
     const q = getSidebarFilterValue(sb);
     const roleNodes = getRoleNodesFast();
 
-    if (roleNodes) {
-      const userSignature = buildRoleNodeSignature(roleNodes.userNodes);
-      const assistantSignature = buildRoleNodeSignature(roleNodes.assistantNodes);
-      const userChanged = forceFullScan || userSignature !== lastUserSignature;
-      const assistantChanged = forceFullScan || assistantSignature !== lastAssistantSignature;
+    pauseObserver();
+    try {
+      if (roleNodes) {
+        const userSignature = buildRoleNodeSignature(roleNodes.userNodes);
+        const assistantSignature = buildRoleNodeSignature(roleNodes.assistantNodes);
+        const userChanged = forceFullScan || userSignature !== lastUserSignature;
+        const assistantChanged = forceFullScan || assistantSignature !== lastAssistantSignature;
 
-      if (assistantChanged) {
-        syncAssistantTogglesFast(roleNodes.assistantNodes);
-      }
+        if (assistantChanged) {
+          syncAssistantTogglesFast(roleNodes.assistantNodes);
+        }
 
-      if (userChanged) {
-        const nextIndex = buildUserIndexFast(roleNodes.userNodes);
-        const changed = !isSameIndex(currentIndex, nextIndex);
-        setCurrentIndex(nextIndex);
-        if (changed || q !== lastRenderedFilter || forceFullScan) {
+        if (userChanged) {
+          const nextIndex = buildUserIndexFast(roleNodes.userNodes);
+          const changed = !isSameIndex(currentIndex, nextIndex);
+          setCurrentIndex(nextIndex);
+          if (changed || q !== lastRenderedFilter || forceFullScan) {
+            renderList(currentIndex, q);
+            lastRenderedFilter = q;
+          }
+        } else if (q !== lastRenderedFilter || forceFullScan) {
           renderList(currentIndex, q);
           lastRenderedFilter = q;
         }
-      } else if (q !== lastRenderedFilter || forceFullScan) {
+
+        lastUserSignature = userSignature;
+        lastAssistantSignature = assistantSignature;
+        forceFullScan = false;
+        return;
+      }
+
+      const nextIndex = scanIndexFallback();
+      const changed = !isSameIndex(currentIndex, nextIndex);
+      setCurrentIndex(nextIndex);
+      if (changed || q !== lastRenderedFilter || forceFullScan) {
         renderList(currentIndex, q);
         lastRenderedFilter = q;
       }
-
-      lastUserSignature = userSignature;
-      lastAssistantSignature = assistantSignature;
+      lastUserSignature = "";
+      lastAssistantSignature = "";
       forceFullScan = false;
-      return;
+    } finally {
+      resumeObserver();
     }
-
-    const nextIndex = scanIndexFallback();
-    const changed = !isSameIndex(currentIndex, nextIndex);
-    setCurrentIndex(nextIndex);
-    if (changed || q !== lastRenderedFilter || forceFullScan) {
-      renderList(currentIndex, q);
-      lastRenderedFilter = q;
-    }
-    lastUserSignature = "";
-    lastAssistantSignature = "";
-    forceFullScan = false;
   }
 
   // ---------- Observe & init ----------
@@ -1088,14 +1189,23 @@
     }
   }
 
+  let observerPaused = false;
+  function pauseObserver() { observerPaused = true; }
+  function resumeObserver() {
+    observerPaused = false;
+    if (mo) mo.takeRecords();
+  }
+
   function startObserver() {
     const nextTarget = document.querySelector("main") || document.body;
     if (mo && observeTarget === nextTarget) return;
     stopObserver();
     observeTarget = nextTarget;
     mo = new MutationObserver((records) => {
-      if (!mutationHasMessageChange(records)) return;
-      if (mutationHasMessageRemoval(records)) forceFullScan = true;
+      if (observerPaused) return;
+      const { hasChange, hasRemoval } = classifyMutations(records);
+      if (!hasChange) return;
+      if (hasRemoval) forceFullScan = true;
       scheduleScan();
     });
     mo.observe(observeTarget, { childList: true, subtree: true });
@@ -1181,17 +1291,28 @@
   function installRouteListeners() {
     if (window.__cgxRouteHooked) return;
     window.__cgxRouteHooked = true;
-    const notify = () => window.dispatchEvent(new Event("cgx:locationchange"));
-    const wrap = (fn) =>
+    const notify = () => {
+      try { window.dispatchEvent(new Event("cgx:locationchange")); } catch {}
+    };
+    const wrap = (original) =>
       function (...args) {
-        const ret = fn.apply(this, args);
+        let ret;
+        try { ret = original.apply(this, args); } catch (e) { throw e; }
         notify();
         return ret;
       };
-    if (history?.pushState) history.pushState = wrap(history.pushState);
-    if (history?.replaceState) history.replaceState = wrap(history.replaceState);
-    window.addEventListener("popstate", notify);
-    window.addEventListener("hashchange", notify);
+    try {
+      if (history?.pushState && !history.pushState.__cgxWrapped) {
+        history.pushState = wrap(history.pushState);
+        history.pushState.__cgxWrapped = true;
+      }
+      if (history?.replaceState && !history.replaceState.__cgxWrapped) {
+        history.replaceState = wrap(history.replaceState);
+        history.replaceState.__cgxWrapped = true;
+      }
+    } catch {}
+    window.addEventListener("popstate", notify, { passive: true });
+    window.addEventListener("hashchange", notify, { passive: true });
     if (window.navigation?.addEventListener) {
       window.navigation.addEventListener("navigate", notify);
     }
@@ -1202,7 +1323,7 @@
         if (!intentPath) return;
         applyFastNavIntent(intentPath);
       },
-      true
+      { capture: true, passive: true }
     );
     window.addEventListener("cgx:locationchange", () => handleRouteChange());
   }
@@ -1223,10 +1344,25 @@
         attributeFilter: ["class", "data-theme", "data-color-mode", "data-color-scheme"]
       });
     }
-    setInterval(() => {
-      if (document.visibilityState === "hidden") return;
-      handleRouteChange();
-    }, ROUTE_POLL_MS);
+    let routePollTimer = null;
+    function startRoutePoll() {
+      if (routePollTimer) return;
+      routePollTimer = setInterval(() => handleRouteChange(), ROUTE_POLL_MS);
+    }
+    function stopRoutePoll() {
+      if (!routePollTimer) return;
+      clearInterval(routePollTimer);
+      routePollTimer = null;
+    }
+    document.addEventListener("visibilitychange", () => {
+      if (document.visibilityState === "hidden") {
+        stopRoutePoll();
+      } else {
+        handleRouteChange();
+        startRoutePoll();
+      }
+    });
+    if (document.visibilityState !== "hidden") startRoutePoll();
 
     window.addEventListener("keydown", (e) => {
       if (e.altKey && e.key.toLowerCase() === "n") {

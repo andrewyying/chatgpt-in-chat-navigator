@@ -76,7 +76,7 @@
   ]);
   const FILE_EXT_PATTERN = Array.from(FILE_NAME_EXTENSIONS)
     .sort((a, b) => b.length - a.length)
-    .map((ext) => ext.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+    .map(escapeRegExp)
     .join("|");
   const FILE_NAME_IN_TEXT_RE = new RegExp(
     `([A-Za-z0-9][A-Za-z0-9 _().-]{0,118}\\.(?:${FILE_EXT_PATTERN}))(?=$|[^A-Za-z0-9]|[A-Z]{2,}(?=[a-z]))`,
@@ -113,8 +113,6 @@
   }
   const EXPAND_SVG_TMPL = parseSvgTemplate(EXPAND_SVG);
   const COLLAPSE_SVG_TMPL = parseSvgTemplate(COLLAPSE_SVG);
-  const BOOKMARK_SVG_TMPL = parseSvgTemplate(BOOKMARK_SVG);
-  const MINUS_SVG_TMPL = parseSvgTemplate(MINUS_SVG);
 
   function setToggleIcon(btn, collapsed) {
     const tmpl = collapsed ? EXPAND_SVG_TMPL : COLLAPSE_SVG_TMPL;
@@ -169,7 +167,7 @@
     const name = sanitizeFileNameCandidate(value);
     if (!name) return false;
     if (name.length < 3 || name.length > 140) return false;
-    if (/[\/\\]/.test(name)) return false;
+    if (/[/\\]/.test(name)) return false;
     const dot = name.lastIndexOf(".");
     if (dot <= 0 || dot === name.length - 1) return false;
     const ext = name.slice(dot + 1).toLowerCase();
@@ -815,8 +813,13 @@
   }
 
   // ---------- Sidebar index ----------
-  let currentIndex = []; // {id, el, title, idx}
-  let currentIndexById = new Map();
+  // Prompts accumulate in `indexById` (keyed by a stable id) instead of being
+  // rebuilt from the DOM on every scan. ChatGPT virtualizes/windows long
+  // conversations, so questions that scroll out of view leave the DOM; keeping
+  // them here is what lets the sidebar list *all* prompts in long chats.
+  let indexById = new Map(); // stableId -> {id, el, title, titleLower, turn, seq, idx, anchorHint}
+  let discoverySeq = 0;
+  let currentIndex = []; // ordered snapshot of indexById, used for rendering
   let lastRenderedFilter = "";
   let lastUserSignature = "";
   let lastAssistantSignature = "";
@@ -824,14 +827,13 @@
   let searchRenderTimer = null;
 
   function setCurrentIndex(nextIndex) {
-    currentIndex = nextIndex;
-    currentIndexById = new Map();
-    for (const item of nextIndex || []) {
-      currentIndexById.set(item.id, item);
-    }
+    currentIndex = nextIndex || [];
   }
 
   function resetScanState() {
+    indexById.clear();
+    discoverySeq = 0;
+    setCurrentIndex([]);
     lastUserSignature = "";
     lastAssistantSignature = "";
     forceFullScan = true;
@@ -864,15 +866,11 @@
     if (!userEl) return null;
     const roleAttr = userEl.getAttribute("data-message-author-role");
     if (roleAttr === "user") {
-      const parent = userEl.parentElement;
-      if (parent) {
-        let sibling = parent.nextElementSibling;
-        while (sibling) {
-          const assistantEl = sibling.querySelector?.("[data-message-author-role='assistant']");
-          if (assistantEl) return assistantEl;
-          if (sibling.getAttribute?.("data-message-author-role") === "assistant") return sibling;
-          break;
-        }
+      const sibling = userEl.parentElement?.nextElementSibling;
+      if (sibling) {
+        const assistantEl = sibling.querySelector?.("[data-message-author-role='assistant']");
+        if (assistantEl) return assistantEl;
+        if (sibling.getAttribute?.("data-message-author-role") === "assistant") return sibling;
       }
     }
     const blocks = findAllMessageBlocks();
@@ -885,7 +883,9 @@
 
   function handleIndexItemClick(it) {
     if (!it) return;
-    if (!it.el || !document.contains(it.el)) {
+    // The prompt is still listed but its node was virtualized out of the DOM.
+    // Re-scan to refresh references for anything currently mounted, then bail.
+    if (!it.el?.isConnected) {
       scanAndRender({ force: true });
       return;
     }
@@ -914,16 +914,108 @@
     if (!card) return;
     const itemId = card.getAttribute("data-cgx-id");
     if (!itemId) return;
-    handleIndexItemClick(currentIndexById.get(itemId));
+    handleIndexItemClick(indexById.get(itemId));
   }
 
-  function isSameIndex(prev, next) {
-    if (prev.length !== next.length) return false;
-    for (let i = 0; i < next.length; i++) {
-      if (prev[i].id !== next[i].id) return false;
-      if (prev[i].title !== next[i].title) return false;
+  function renderIfNeeded(changed, q) {
+    if (changed || q !== lastRenderedFilter || forceFullScan) {
+      renderList(currentIndex, q);
+      lastRenderedFilter = q;
     }
-    return true;
+  }
+
+  // ChatGPT tags each turn as article[data-testid="conversation-turn-N"]; N is a
+  // stable, absolute position we can order by even when only a window of turns is
+  // mounted. Returns null when the turn number can't be read.
+  function conversationTurnNumber(el) {
+    const testId = el?.closest?.("article[data-testid^='conversation-turn-']")?.getAttribute?.("data-testid");
+    if (!testId) return null;
+    const n = Number(testId.slice(18)); // "conversation-turn-".length === 18
+    return Number.isFinite(n) ? n : null;
+  }
+
+  // Insert or refresh a prompt in the cumulative store. Returns true when the
+  // ordered view needs rebuilding (new entry, or title/turn changed). A moved
+  // DOM node (same id) just refreshes `el` silently — no re-render required.
+  function upsertUserEntry(el, domIndex) {
+    const id = stableIdForElement(el, domIndex);
+    const title = getCachedTitle(el) || "[Media]";
+    const turn = conversationTurnNumber(el);
+    const existing = indexById.get(id);
+    if (!existing) {
+      indexById.set(id, {
+        id,
+        el,
+        title,
+        titleLower: title.toLowerCase(),
+        turn,
+        seq: discoverySeq++,
+        idx: 0,
+        anchorHint: ""
+      });
+      return true;
+    }
+    existing.el = el;
+    let changed = false;
+    if (existing.title !== title) {
+      existing.title = title;
+      existing.titleLower = title.toLowerCase();
+      changed = true;
+    }
+    if (existing.turn !== turn) {
+      existing.turn = turn;
+      changed = true;
+    }
+    return changed;
+  }
+
+  function mergeUserNodesIntoIndex(userNodes) {
+    let changed = false;
+    for (let i = 0; i < userNodes.length; i++) {
+      const el = userNodes[i];
+      if (isComposerArea(el)) continue;
+      if (upsertUserEntry(el, i)) changed = true;
+    }
+    return changed;
+  }
+
+  // Rebuild the ordered render snapshot from the store. Turn-number collisions
+  // (editing a prompt spawns a new branch that reuses turn numbers) are resolved
+  // in favour of the live in-DOM entry, pruning the stale branch from the store.
+  function rebuildOrderedIndex() {
+    const entries = Array.from(indexById.values());
+    const byTurn = new Map();
+    const untimed = [];
+    for (const e of entries) {
+      if (e.turn == null) {
+        untimed.push(e);
+        continue;
+      }
+      const prev = byTurn.get(e.turn);
+      if (!prev) {
+        byTurn.set(e.turn, e);
+        continue;
+      }
+      const eLive = !!e.el?.isConnected;
+      const prevLive = !!prev.el?.isConnected;
+      if (eLive !== prevLive ? eLive : e.seq > prev.seq) byTurn.set(e.turn, e);
+    }
+
+    const ordered = [...byTurn.values(), ...untimed];
+    if (ordered.length !== entries.length) {
+      const keep = new Set(ordered);
+      for (const [id, e] of indexById) {
+        if (!keep.has(e)) indexById.delete(id);
+      }
+    }
+
+    ordered.sort((a, b) => {
+      const at = a.turn == null ? Infinity : a.turn;
+      const bt = b.turn == null ? Infinity : b.turn;
+      return at - bt || a.seq - b.seq;
+    });
+    for (let i = 0; i < ordered.length; i++) ordered[i].idx = i + 1;
+    setCurrentIndex(ordered);
   }
 
   function renderList(indexItems, filterLower) {
@@ -988,8 +1080,17 @@
   }
 
   function getRoleNodesFast() {
-    const userNodes = document.querySelectorAll("[data-message-author-role='user']");
-    const assistantNodes = document.querySelectorAll("[data-message-author-role='assistant']");
+    // Single document traversal, then partition by role. Halves the DOM
+    // work of the previous two-querySelectorAll approach on the hot path.
+    const roleNodes = document.querySelectorAll(MESSAGE_ROLE_SELECTOR);
+    if (!roleNodes.length) return null;
+    const userNodes = [];
+    const assistantNodes = [];
+    for (const node of roleNodes) {
+      const role = node.getAttribute("data-message-author-role");
+      if (role === "user") userNodes.push(node);
+      else if (role === "assistant") assistantNodes.push(node);
+    }
     if (!userNodes.length && !assistantNodes.length) return null;
     return { userNodes, assistantNodes };
   }
@@ -1026,39 +1127,15 @@
     }
   }
 
-  function buildUserIndexFast(userNodes) {
-    const index = [];
-    let userCount = 0;
-
-    for (let i = 0; i < userNodes.length; i++) {
-      const el = userNodes[i];
-      if (isComposerArea(el)) continue;
-      userCount++;
-      const id = stableIdForElement(el, i);
-      const title = getCachedTitle(el) || "[Media]";
-      index.push({
-        id,
-        el,
-        title,
-        titleLower: title.toLowerCase(),
-        idx: userCount,
-        anchorHint: ""
-      });
-    }
-
-    return index;
-  }
-
   function scanIndexFallback() {
     const blocks = findAllMessageBlocks();
-    const index = [];
-    let userCount = 0;
+    let changed = false;
     const keepToggles = new Set();
 
     for (let i = 0; i < blocks.length; i++) {
       const el = blocks[i];
-      const role = getRole(el);
       if (isComposerArea(el)) continue;
+      const role = getRole(el);
 
       if (role === "assistant") {
         const id = stableIdForElement(el, i);
@@ -1069,18 +1146,7 @@
 
       if (role !== "user") continue;
       if (!isElementVisible(el)) continue;
-
-      userCount++;
-      const id = stableIdForElement(el, i);
-      const title = getCachedTitle(el);
-      index.push({
-        id,
-        el,
-        title: title || "[Media]",
-        titleLower: (title || "[Media]").toLowerCase(),
-        idx: userCount,
-        anchorHint: ""
-      });
+      if (upsertUserEntry(el, i)) changed = true;
     }
     document.querySelectorAll(`.${EXT_NS}-toggle`).forEach((btn) => {
       if (!keepToggles.has(btn)) btn.remove();
@@ -1089,7 +1155,7 @@
       const btn = wrap.querySelector?.(`.${EXT_NS}-toggle`);
       if (!btn || !keepToggles.has(btn)) wrap.remove();
     });
-    return index;
+    return changed;
   }
 
   async function scanAndRender(options = {}) {
@@ -1113,16 +1179,11 @@
         }
 
         if (userChanged) {
-          const nextIndex = buildUserIndexFast(roleNodes.userNodes);
-          const changed = !isSameIndex(currentIndex, nextIndex);
-          setCurrentIndex(nextIndex);
-          if (changed || q !== lastRenderedFilter || forceFullScan) {
-            renderList(currentIndex, q);
-            lastRenderedFilter = q;
-          }
-        } else if (q !== lastRenderedFilter || forceFullScan) {
-          renderList(currentIndex, q);
-          lastRenderedFilter = q;
+          const changed = mergeUserNodesIntoIndex(roleNodes.userNodes);
+          if (changed) rebuildOrderedIndex();
+          renderIfNeeded(changed, q);
+        } else {
+          renderIfNeeded(false, q);
         }
 
         lastUserSignature = userSignature;
@@ -1131,13 +1192,9 @@
         return;
       }
 
-      const nextIndex = scanIndexFallback();
-      const changed = !isSameIndex(currentIndex, nextIndex);
-      setCurrentIndex(nextIndex);
-      if (changed || q !== lastRenderedFilter || forceFullScan) {
-        renderList(currentIndex, q);
-        lastRenderedFilter = q;
-      }
+      const fallbackChanged = scanIndexFallback();
+      if (fallbackChanged) rebuildOrderedIndex();
+      renderIfNeeded(fallbackChanged, q);
       lastUserSignature = "";
       lastAssistantSignature = "";
       forceFullScan = false;
@@ -1296,8 +1353,7 @@
     };
     const wrap = (original) =>
       function (...args) {
-        let ret;
-        try { ret = original.apply(this, args); } catch (e) { throw e; }
+        const ret = original.apply(this, args);
         notify();
         return ret;
       };

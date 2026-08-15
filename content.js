@@ -1,25 +1,35 @@
+/**
+ * ChatGPT Navigator — sidebar, prompt index and answer folding.
+ *
+ * This file owns the extension's UI and state. It deliberately knows nothing
+ * about ChatGPT's markup: every question about the page ("where are the
+ * turns?", "who wrote this one?", "which part folds?") goes through CGXDom in
+ * src/chatgpt-dom.js, and prompt ordering goes through CGXOrder in
+ * src/turn-order.js.
+ */
 (() => {
   const EXT_NS = "cgx";
   const SIDEBAR_ID = "cgx-sidebar";
   const STORAGE_KEY_PREFIX = "cgx_state_v1";
   const PREFS_KEY = "cgx_prefs_v1";
   const TITLE_CACHE_VERSION = "2";
-  const DEBOUNCE_MS = 450;
+  const DEBOUNCE_MS = 250;
+  // A streaming answer mutates the DOM continuously, which resets a plain
+  // debounce forever. Cap the total wait so the sidebar still updates mid-answer.
+  const MAX_SCAN_DELAY_MS = 800;
   const SEARCH_INPUT_DEBOUNCE_MS = 140;
-  const IDLE_TIMEOUT_MS = 1200;
-  const ROUTE_POLL_MS = 5000;
-  const MESSAGE_ROLE_SELECTOR = "[data-message-author-role]";
-  const MESSAGE_ID_SELECTOR = "[data-message-id]";
-  const TURN_SELECTOR = "article[data-testid^='conversation-turn-'], [data-turn-id]";
-  const ATTACHMENT_NODE_SELECTOR = [
-    "a[download]",
-    "a[href*='/files/']",
-    "a[href^='sandbox:']",
-    "[data-testid*='attachment']",
-    "[data-testid*='file']",
-    "[aria-label*='attachment' i]",
-    "[aria-label*='file' i]"
-  ].join(", ");
+  const IDLE_TIMEOUT_MS = 300;
+  // ChatGPT navigates from the page's own world. A content script runs in an
+  // isolated world, so the history.pushState wrapper installed below never
+  // sees those calls — reading location.pathname is the only reliable signal.
+  // It is a string compare, so polling it often costs nothing.
+  const ROUTE_POLL_MS = 150;
+  // If a click looked like navigation but the URL never moved, put the list back.
+  const NAV_INTENT_TIMEOUT_MS = 1500;
+  const INIT_DELAY_MS = 200;
+  // How long after a conversation switch we keep ignoring turns belonging to
+  // the conversation we just left.
+  const STALE_GUARD_MS = 4000;
   const FILE_NAME_EXTENSIONS = new Set([
     "pdf",
     "doc",
@@ -152,6 +162,18 @@
     return out;
   }
 
+  // FNV-1a. Used to derive a stable id for a prompt when the markup gives us
+  // no id of its own — see stableIdForElement.
+  function hashString(value) {
+    let h = 0x811c9dc5;
+    const s = String(value || "");
+    for (let i = 0; i < s.length; i++) {
+      h ^= s.charCodeAt(i);
+      h = Math.imul(h, 0x01000193);
+    }
+    return (h >>> 0).toString(36);
+  }
+
   function sanitizeFileNameCandidate(value) {
     return String(value || "")
       .replace(/\s+/g, " ")
@@ -201,8 +223,8 @@
 
   function extractUploadedFileNames(el) {
     if (!el?.querySelectorAll) return [];
-    if (!el.querySelector?.(ATTACHMENT_NODE_SELECTOR)) return [];
-    const nodes = el.querySelectorAll(ATTACHMENT_NODE_SELECTOR);
+    if (!el.querySelector?.(CGXDom.ATTACHMENT_SELECTOR)) return [];
+    const nodes = el.querySelectorAll(CGXDom.ATTACHMENT_SELECTOR);
     if (!nodes.length) return [];
 
     const names = [];
@@ -249,8 +271,10 @@
 
   function extractTextWithoutAttachmentNodes(el) {
     if (!el?.querySelectorAll) return (el?.textContent || "").trim();
-    if (!el.querySelector?.(ATTACHMENT_NODE_SELECTOR)) return String(el.textContent || "").replace(/\s+/g, " ").trim();
-    const attachmentNodes = el.querySelectorAll(ATTACHMENT_NODE_SELECTOR);
+    if (!el.querySelector?.(CGXDom.ATTACHMENT_SELECTOR)) {
+      return String(el.textContent || "").replace(/\s+/g, " ").trim();
+    }
+    const attachmentNodes = el.querySelectorAll(CGXDom.ATTACHMENT_SELECTOR);
     const skipSet = new Set(attachmentNodes);
     const parts = [];
     const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT, {
@@ -350,85 +374,20 @@
     return String(value).replace(/"/g, '\\"');
   }
 
-  function isElementVisible(el) {
-    if (!el) return false;
-    return el.offsetWidth > 0 || el.offsetHeight > 0;
-  }
-
-  const composerCache = new WeakMap();
-  function isComposerArea(el) {
-    if (!el || !el.querySelector) return false;
-    const cached = composerCache.get(el);
-    if (cached !== undefined) return cached;
-    const result = !!el.querySelector("textarea, [contenteditable='true'], [data-testid*='prompt']");
-    composerCache.set(el, result);
-    return result;
-  }
-
-  function detectThemeFromDom() {
-    const attrKeys = ["data-theme", "data-color-mode", "data-color-scheme"];
-    const els = [document.documentElement, document.body];
-    for (const el of els) {
-      if (!el) continue;
-      for (const key of attrKeys) {
-        const val = el.getAttribute?.(key);
-        if (val) {
-          const v = String(val).toLowerCase();
-          if (v.includes("dark")) return "dark";
-          if (v.includes("light")) return "light";
-        }
-      }
-      const cls = el.className || "";
-      if (/\bdark\b/i.test(cls)) return "dark";
-      if (/\blight\b/i.test(cls)) return "light";
-    }
-    return null;
-  }
-
   function applyThemeFromDom() {
-    const theme = detectThemeFromDom();
+    const theme = CGXDom.detectTheme();
     if (theme) document.documentElement.setAttribute("data-cgx-theme", theme);
     else document.documentElement.removeAttribute("data-cgx-theme");
   }
 
   function isChatRoute(pathname = location.pathname) {
-    return /\/c\/[^/]+/.test(pathname);
+    return CGXDom.isChatRoute(pathname);
   }
 
   function removeInjectedUI() {
     document.getElementById(SIDEBAR_ID)?.remove();
     document.getElementById("cgx-show-pill")?.remove();
     document.querySelectorAll(`.${EXT_NS}-toggle, .${EXT_NS}-toggle-wrap`).forEach((el) => el.remove());
-  }
-
-  function isLikelyMessageNode(node) {
-    if (!node || node.nodeType !== 1) return false;
-    if (
-      node.hasAttribute("data-message-author-role") ||
-      node.hasAttribute("data-message-id") ||
-      node.hasAttribute("data-turn-id")
-    ) {
-      return true;
-    }
-    const dataTestId = node.getAttribute("data-testid");
-    if (typeof dataTestId === "string" && dataTestId.startsWith("conversation-turn-")) return true;
-    if (node.tagName === "ARTICLE" && dataTestId) return true;
-    return false;
-  }
-
-  function subtreeHasMessageNode(node) {
-    if (!node || !node.querySelector) return false;
-    return !!(
-      node.querySelector(MESSAGE_ROLE_SELECTOR) ||
-      node.querySelector(MESSAGE_ID_SELECTOR) ||
-      node.querySelector(TURN_SELECTOR)
-    );
-  }
-
-  function nodeIsOrContainsMessage(node) {
-    if (isLikelyMessageNode(node)) return true;
-    if (node.nodeType === 1 && node.childElementCount > 0) return subtreeHasMessageNode(node);
-    return false;
   }
 
   function classifyMutations(records) {
@@ -438,12 +397,12 @@
       if (m.type !== "childList") continue;
       if (!hasChange && m.addedNodes) {
         for (const node of m.addedNodes) {
-          if (nodeIsOrContainsMessage(node)) { hasChange = true; break; }
+          if (CGXDom.containsMessage(node)) { hasChange = true; break; }
         }
       }
       if (m.removedNodes) {
         for (const node of m.removedNodes) {
-          if (nodeIsOrContainsMessage(node)) {
+          if (CGXDom.containsMessage(node)) {
             hasChange = true;
             hasRemoval = true;
             break;
@@ -453,41 +412,6 @@
       if (hasChange && hasRemoval) break;
     }
     return { hasChange, hasRemoval };
-  }
-
-  function findAllMessageBlocks() {
-    const roleNodes = document.querySelectorAll(MESSAGE_ROLE_SELECTOR);
-    if (roleNodes?.length) return Array.from(roleNodes);
-
-    const turns = document.querySelectorAll(`main ${TURN_SELECTOR}, main ${MESSAGE_ID_SELECTOR}`);
-    if (turns?.length) return Array.from(turns);
-
-    const candidates = document.querySelectorAll("main div, main article, main section");
-    const blocks = [];
-    for (const el of candidates) {
-      if (isComposerArea(el)) continue;
-      const txt = (el.textContent || "").trim();
-      if (txt.length < 5) continue;
-      const pCount = el.querySelectorAll("p").length;
-      if (pCount === 0 && txt.length < 40) continue;
-      if (el.offsetHeight < 20) continue;
-      blocks.push(el);
-    }
-    return blocks;
-  }
-
-  function getRole(el) {
-    const role =
-      el.getAttribute?.("data-message-author-role") ||
-      el.getAttribute?.("data-turn") ||
-      el.closest?.("[data-turn]")?.getAttribute?.("data-turn");
-    if (typeof role === "string" && role.length) return role;
-    const t = (el.textContent || "").trim();
-    const hasCopy = !!el.querySelector?.('button[aria-label*="Copy"], button[aria-label*="copy"]');
-    if (/^you\b/i.test(t)) return "user";
-    if (/chatgpt/i.test(t)) return "assistant";
-    if (hasCopy && t.length > 80) return "assistant";
-    return null;
   }
 
   function extractUserText(el, uploadedFiles) {
@@ -522,13 +446,30 @@
     return title;
   }
 
-  function stableIdForElement(el, idx) {
+  /**
+   * A key for a turn that survives ChatGPT unmounting and remounting it.
+   *
+   * Order matters. An id we already stamped wins, then whatever id the markup
+   * exposes, then the absolute turn number. Only if all of those are missing do
+   * we fall back to hashing the prompt text — remounting must not mint a new
+   * id, or the sidebar fills up with duplicates of the same question.
+   */
+  function stableIdForElement(el, idx, role) {
     const existing = el.getAttribute(`data-${EXT_NS}-id`);
     if (existing) return existing;
-    const dataId =
-      el.getAttribute?.("data-message-id") ?? el.closest?.("[data-message-id]")?.getAttribute?.("data-message-id");
-    const turnId = el.getAttribute?.("data-turn-id") ?? el.closest?.("[data-turn-id]")?.getAttribute?.("data-turn-id");
-    const base = dataId || turnId || `${idx.toString(36)}_${Math.random().toString(36).slice(2, 9)}`;
+
+    let base = CGXDom.stableKey(el);
+    if (!base) {
+      const turn = CGXDom.turnNumber(el);
+      if (turn != null) base = `turn${turn}`;
+    }
+    if (!base && role === CGXDom.ROLE_USER) {
+      // Two prompts with identical text would collide; upsertUserEntry
+      // disambiguates when it sees both mounted at once.
+      base = `h${hashString((el.textContent || "").replace(/\s+/g, " ").trim())}`;
+    }
+    if (!base) base = `${idx.toString(36)}_${Math.random().toString(36).slice(2, 9)}`;
+
     const id = `${EXT_NS}_${base}`;
     el.setAttribute(`data-${EXT_NS}-id`, id);
     return id;
@@ -578,8 +519,12 @@
     search.addEventListener("input", scheduleSearchRender);
     sb.querySelector("#cgx-list").addEventListener("click", onListClick);
 
-    // Refresh
-    sb.querySelector("#cgx-refresh").addEventListener("click", () => scanAndRender({ force: true }));
+    // Refresh: also forget the resolved DOM strategy, so a manual refresh can
+    // recover from ChatGPT swapping its markup mid-session.
+    sb.querySelector("#cgx-refresh").addEventListener("click", () => {
+      CGXDom.resetStrategy();
+      scanAndRender({ force: true });
+    });
 
     // Collapse/Expand all
     sb.querySelector("#cgx-collapse-all").addEventListener("click", () => setAllAssistantCollapsed(true));
@@ -638,7 +583,7 @@
   async function loadState() {
     const key = getConversationKey();
     return new Promise((resolve) => {
-      chrome.storage.local.get([key], (res) => resolve(res[key] || { collapsed: {} }));
+      chrome.storage.local.get([key], (res) => resolve(normalizeState(res[key])));
     });
   }
 
@@ -693,43 +638,70 @@
   }
 
   // ---------- Collapse logic ----------
-  let stateCache = { collapsed: {} };
-
-  function isCollapsed(messageId) {
-    return !!stateCache.collapsed?.[messageId];
+  //
+  // Stored as a conversation-wide default plus per-answer overrides, not as a
+  // set of collapsed ids. ChatGPT only mounts a window of the thread, so
+  // "Collapse all" can never reach every answer at the moment it is clicked —
+  // recording it as a default is what makes answers arrive already folded when
+  // they finally mount.
+  //
+  // `defaultCollapsedUpTo` pins the default to answers that existed when the
+  // button was pressed, so a reply you ask for afterwards isn't folded away
+  // while it is still being written.
+  function normalizeState(raw) {
+    const s = raw && typeof raw === "object" ? raw : {};
+    if (s.overrides || typeof s.defaultCollapsed === "boolean") {
+      return {
+        defaultCollapsed: !!s.defaultCollapsed,
+        defaultCollapsedUpTo: Number.isFinite(s.defaultCollapsedUpTo) ? s.defaultCollapsedUpTo : null,
+        overrides: { ...(s.overrides || {}) }
+      };
+    }
+    // v1 stored a plain set of collapsed message ids.
+    const overrides = {};
+    for (const id of Object.keys(s.collapsed || {})) overrides[id] = true;
+    return { defaultCollapsed: false, defaultCollapsedUpTo: null, overrides };
   }
 
-  function setCollapsed(messageId, value) {
-    stateCache.collapsed = stateCache.collapsed || {};
-    if (value) stateCache.collapsed[messageId] = true;
-    else delete stateCache.collapsed[messageId];
+  let stateCache = normalizeState(null);
+
+  function isCollapsed(messageId, el) {
+    const overrides = stateCache.overrides;
+    if (overrides && Object.prototype.hasOwnProperty.call(overrides, messageId)) return !!overrides[messageId];
+    if (!stateCache.defaultCollapsed) return false;
+    const limit = stateCache.defaultCollapsedUpTo;
+    if (limit == null) return true;
+    const turn = el ? CGXDom.turnNumber(el) : null;
+    return turn == null ? true : turn <= limit;
+  }
+
+  function setCollapsed(messageId, value, el) {
+    stateCache.overrides = stateCache.overrides || {};
+    // Record only a deviation from the default: drop any existing override,
+    // see what the default gives, and re-add one only if it disagrees. Keeping
+    // the map sparse is what lets "Collapse all" keep applying to answers that
+    // have not mounted yet.
+    delete stateCache.overrides[messageId];
+    if (isCollapsed(messageId, el) !== !!value) stateCache.overrides[messageId] = !!value;
     saveState(stateCache);
   }
 
-  function findAssistantContentContainer(blockEl) {
-    if (!blockEl) return null;
-    if (isComposerArea(blockEl)) return null;
-    const md = blockEl.querySelector?.(".markdown, [class*='markdown'], [class*='prose']");
-    if (md && !isComposerArea(md)) return md;
-    const textBlock =
-      blockEl.querySelector?.("[data-message-author-role='assistant']") ||
-      blockEl.querySelector?.("[class*='text']");
-    if (textBlock && textBlock !== blockEl && !isComposerArea(textBlock)) return textBlock;
-    const leaf = blockEl.querySelector?.("p, pre, code, li");
-    if (leaf) {
-      const closest = leaf.closest?.("div, article, section") || leaf;
-      if (!isComposerArea(closest)) return closest;
+  // Highest turn number we know about, mounted or merely indexed.
+  function highestKnownTurn(scan) {
+    let max = null;
+    for (const entry of indexById.values()) {
+      if (CGXOrder.hasTurn(entry) && (max == null || entry.turn > max)) max = entry.turn;
     }
-    const tag = blockEl.tagName?.toUpperCase?.();
-    if (blockEl.getAttribute?.("data-message-author-role") === "assistant" && tag && !["BODY", "HTML", "MAIN"].includes(tag)) {
-      return blockEl;
+    for (const t of scan?.turns || []) {
+      const n = CGXDom.turnNumber(t.el);
+      if (n != null && (max == null || n > max)) max = n;
     }
-    return null;
+    return max;
   }
 
   function injectToggleForAssistant(blockEl, messageId) {
-    const content = findAssistantContentContainer(blockEl);
-    if (!content || isComposerArea(content)) return null;
+    const content = CGXDom.assistantContent(blockEl);
+    if (!content || CGXDom.isComposer(content)) return null;
 
     let wrap = blockEl.querySelector?.(`.${EXT_NS}-toggle-wrap`);
     if (!wrap) {
@@ -756,7 +728,7 @@
     }
 
     const apply = () => {
-      const collapsed = isCollapsed(messageId);
+      const collapsed = isCollapsed(messageId, blockEl);
       content.classList.toggle("cgx-collapsed", collapsed);
       setToggleIcon(btn, collapsed);
     };
@@ -771,10 +743,10 @@
         if (!targetId) return;
         const targetEl = document.querySelector(`[data-${EXT_NS}-id="${safeAttrSelector(targetId)}"]`);
         if (!targetEl) return;
-        const targetContent = findAssistantContentContainer(targetEl);
+        const targetContent = CGXDom.assistantContent(targetEl);
         if (!targetContent) return;
-        const next = !isCollapsed(targetId);
-        setCollapsed(targetId, next);
+        const next = !isCollapsed(targetId, targetEl);
+        setCollapsed(targetId, next, targetEl);
         targetContent.classList.toggle("cgx-collapsed", next);
         setToggleIcon(btn, next);
       });
@@ -785,31 +757,27 @@
   }
 
   async function setAllAssistantCollapsed(value) {
-    const roleNodes = getRoleNodesFast();
-    const blocks = roleNodes ? Array.from(roleNodes.assistantNodes) : findAllMessageBlocks();
-    let changed = false;
+    const scan = CGXDom.scanTurns();
+
+    // Set the conversation default and clear every per-answer deviation. The
+    // answers currently on screen are updated below; the ones ChatGPT hasn't
+    // mounted pick this up from the default when they appear.
+    stateCache.defaultCollapsed = !!value;
+    stateCache.overrides = {};
+    stateCache.defaultCollapsedUpTo = value ? highestKnownTurn(scan) : null;
 
     pauseObserver();
     try {
-      for (let i = 0; i < blocks.length; i++) {
-        const el = blocks[i];
-        if (isComposerArea(el)) continue;
-        if (!roleNodes && getRole(el) !== "assistant") continue;
-        const id = stableIdForElement(el, i);
-        if (value && !isCollapsed(id)) {
-          stateCache.collapsed[id] = true;
-          changed = true;
-        } else if (!value && isCollapsed(id)) {
-          delete stateCache.collapsed[id];
-          changed = true;
-        }
-        injectToggleForAssistant(el, id);
+      for (let i = 0; i < scan.assistant.length; i++) {
+        const el = scan.assistant[i];
+        if (CGXDom.isComposer(el)) continue;
+        injectToggleForAssistant(el, stableIdForElement(el, i, CGXDom.ROLE_ASSISTANT));
       }
     } finally {
       resumeObserver();
     }
 
-    if (changed) await saveStateNow(stateCache);
+    await saveStateNow(stateCache);
   }
 
   // ---------- Sidebar index ----------
@@ -817,12 +785,13 @@
   // rebuilt from the DOM on every scan. ChatGPT virtualizes/windows long
   // conversations, so questions that scroll out of view leave the DOM; keeping
   // them here is what lets the sidebar list *all* prompts in long chats.
-  let indexById = new Map(); // stableId -> {id, el, title, titleLower, turn, seq, idx, anchorHint}
+  let indexById = new Map(); // stableId -> {id, el, title, titleLower, turn, rank, seq, idx, anchorHint}
   let discoverySeq = 0;
   let currentIndex = []; // ordered snapshot of indexById, used for rendering
   let lastRenderedFilter = "";
   let lastUserSignature = "";
   let lastAssistantSignature = "";
+  let lastScanTurns = [];
   let forceFullScan = true;
   let searchRenderTimer = null;
 
@@ -836,8 +805,12 @@
     setCurrentIndex([]);
     lastUserSignature = "";
     lastAssistantSignature = "";
+    lastScanTurns = [];
     forceFullScan = true;
+    apiOrder = null;
+    apiLoadedForPath = "";
     regexCache.clear();
+    CGXDom.resetStrategy();
   }
 
   function clearSearchRenderTimer() {
@@ -862,51 +835,195 @@
     }, SEARCH_INPUT_DEBOUNCE_MS);
   }
 
-  function findNextAssistantForUser(userEl) {
+  // The answer that belongs to a prompt is the next assistant turn after it.
+  // Uses the ordered turn list from the last scan so it costs nothing extra.
+  function findNextAssistantForUser(userEl, turns, allowRescan = true) {
     if (!userEl) return null;
-    const roleAttr = userEl.getAttribute("data-message-author-role");
-    if (roleAttr === "user") {
-      const sibling = userEl.parentElement?.nextElementSibling;
-      if (sibling) {
-        const assistantEl = sibling.querySelector?.("[data-message-author-role='assistant']");
-        if (assistantEl) return assistantEl;
-        if (sibling.getAttribute?.("data-message-author-role") === "assistant") return sibling;
-      }
+    const list = turns || lastScanTurns;
+    const idx = list.findIndex((t) => t.el === userEl);
+    if (idx < 0) {
+      if (!allowRescan) return null;
+      lastScanTurns = CGXDom.scanTurns().turns;
+      return findNextAssistantForUser(userEl, lastScanTurns, false);
     }
-    const blocks = findAllMessageBlocks();
-    const idx = blocks.indexOf(userEl);
-    if (idx < 0) return null;
-    const next = blocks[idx + 1];
-    if (!next) return null;
-    return getRole(next) === "assistant" ? next : null;
+    for (let i = idx + 1; i < list.length; i++) {
+      if (list[i].role === CGXDom.ROLE_ASSISTANT) return list[i].el;
+      // Hit the next question before finding an answer — nothing to expand.
+      if (list[i].role === CGXDom.ROLE_USER) return null;
+    }
+    return null;
   }
 
-  function handleIndexItemClick(it) {
-    if (!it) return;
-    // The prompt is still listed but its node was virtualized out of the DOM.
-    // Re-scan to refresh references for anything currently mounted, then bail.
-    if (!it.el?.isConnected) {
-      scanAndRender({ force: true });
-      return;
-    }
-    it.el.scrollIntoView({ behavior: "smooth", block: "start" });
-    it.el.classList.remove("cgx-highlight");
-    void it.el.offsetWidth;
-    it.el.classList.add("cgx-highlight");
-    setTimeout(() => it.el?.classList?.remove("cgx-highlight"), 1300);
+  // ---------- Jumping to a prompt ----------
+  // The sidebar lists every prompt, but ChatGPT only mounts a window of them,
+  // so the one being clicked often has no element yet. Look for it, then fall
+  // back to scrolling the thread until ChatGPT renders it.
+  const HUNT_ATTEMPTS = 10;
+  const HUNT_MOUNT_TIMEOUT_MS = 300;
+  const SETTLE_PASSES = 6;
+  const SETTLE_PAUSE_MS = 90;
+  const POLL_STEP_MS = 30;
 
-    const next = findNextAssistantForUser(it.el);
+  function sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  // Poll until `predicate` returns something truthy, or give up. Used instead
+  // of a fixed number of frames because how long ChatGPT takes to render a
+  // freshly scrolled-to turn varies a lot with thread length.
+  async function waitFor(predicate, timeoutMs) {
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+      const value = predicate();
+      if (value) return value;
+      if (Date.now() >= deadline) return null;
+      await sleep(POLL_STEP_MS);
+    }
+  }
+
+  function findScroller() {
+    const anchor = document.querySelector("[data-message-id]") || CGXDom.conversationRoot();
+    let el = anchor?.parentElement;
+    while (el && el !== document.body) {
+      if (el.scrollHeight > el.clientHeight + 32) {
+        const overflowY = getComputedStyle(el).overflowY;
+        if (overflowY === "auto" || overflowY === "scroll") return el;
+      }
+      el = el.parentElement;
+    }
+    return document.scrollingElement || document.documentElement;
+  }
+
+  function messageElement(messageId) {
+    if (!messageId) return null;
+    const safe = safeAttrSelector(messageId);
+    // Queried separately, not as one comma selector: the container wraps the
+    // message, so a combined query would return the container by document
+    // order. Callers need the message itself when it exists — it is what the
+    // turn scan yields, and what expanding the answer below it keys off.
+    return (
+      document.querySelector(`[data-message-id="${safe}"]`) ||
+      // Placeholder that survives when the message itself is unmounted; still
+      // worth scrolling to.
+      document.querySelector(`[data-turn-id-container="${safe}"]`)
+    );
+  }
+
+  // Which slice of the conversation is mounted, expressed in API positions.
+  function mountedApiRange() {
+    if (!apiOrder) return null;
+    let min = Infinity;
+    let max = -Infinity;
+    for (const el of document.querySelectorAll("[data-message-id]")) {
+      const pos = apiOrder.get(el.getAttribute("data-message-id"));
+      if (pos == null) continue;
+      if (pos < min) min = pos;
+      if (pos > max) max = pos;
+    }
+    return min === Infinity ? null : { min, max };
+  }
+
+  // Bisect on scroll position until the wanted turn mounts. Each pass compares
+  // the target against the range currently on screen, so it converges in a few
+  // steps instead of crawling the thread.
+  async function huntForMessage(entry) {
+    if (!entry.messageId) return null;
+    const scroller = findScroller();
+    if (scroller.scrollHeight - scroller.clientHeight <= 0) return null;
+
+    const total = apiOrder?.size || currentIndex.length || 1;
+    const position = entry.apiIndex != null ? entry.apiIndex : Math.max(0, currentIndex.indexOf(entry));
+    let lo = 0;
+    let hi = 1;
+    let guess = Math.min(1, Math.max(0, position / Math.max(1, total - 1)));
+
+    for (let attempt = 0; attempt < HUNT_ATTEMPTS; attempt++) {
+      scroller.scrollTop = (scroller.scrollHeight - scroller.clientHeight) * guess;
+      const found = await waitFor(() => messageElement(entry.messageId), HUNT_MOUNT_TIMEOUT_MS);
+      if (found) return found;
+
+      const range = mountedApiRange();
+      if (!range || entry.apiIndex == null) break;
+      if (entry.apiIndex < range.min) hi = guess;
+      else if (entry.apiIndex > range.max) lo = guess;
+      else break; // in range but absent — scrolling more won't help
+      guess = (lo + hi) / 2;
+    }
+    return messageElement(entry.messageId);
+  }
+
+  /**
+   * Bring a turn to rest near the top of the viewport.
+   *
+   * Scrolling to a turn is not a single operation. Landing there makes ChatGPT
+   * mount the turns around it, which changes the height of everything above
+   * and shifts the target out from under the scroll — a smooth scroll gets
+   * abandoned mid-flight and stops short, which is why a jump used to need a
+   * second click. So: jump instantly, let the thread relayout, look at where
+   * the target actually ended up, and correct until it stays put.
+   */
+  async function settleOnElement(entry, initial) {
+    let el = initial;
+    for (let pass = 0; pass < SETTLE_PASSES; pass++) {
+      if (!el?.isConnected) {
+        el = entry.messageId ? await waitFor(() => messageElement(entry.messageId), HUNT_MOUNT_TIMEOUT_MS) : null;
+        if (!el) return null;
+      }
+
+      const rect = el.getBoundingClientRect();
+      const viewportHeight = window.innerHeight || document.documentElement.clientHeight || 0;
+      const restingNearTop = rect.top >= 0 && rect.top <= Math.max(120, viewportHeight * 0.5);
+      if (restingNearTop) return el;
+
+      // "auto", never "smooth" — an instant scroll cannot be interrupted by
+      // the relayout it triggers.
+      el.scrollIntoView({ behavior: "auto", block: "start" });
+      await sleep(SETTLE_PAUSE_MS);
+      if (entry.messageId) el = messageElement(entry.messageId) || el;
+    }
+    return el;
+  }
+
+  function flashElement(el) {
+    el.classList.remove("cgx-highlight");
+    void el.offsetWidth;
+    el.classList.add("cgx-highlight");
+    setTimeout(() => el?.classList?.remove("cgx-highlight"), 1300);
+  }
+
+  function expandAnswerFor(userEl) {
+    const next = findNextAssistantForUser(userEl);
     if (!next) return;
     const nextId = next.getAttribute?.(`data-${EXT_NS}-id`);
-    if (!nextId || !isCollapsed(nextId)) return;
-    stateCache.collapsed = stateCache.collapsed || {};
-    delete stateCache.collapsed[nextId];
-    saveState(stateCache);
-    const content = findAssistantContentContainer(next);
+    if (!nextId || !isCollapsed(nextId, next)) return;
+    setCollapsed(nextId, false, next);
+    const content = CGXDom.assistantContent(next);
     content?.classList?.remove("cgx-collapsed");
     const toggleBtn = next.querySelector?.(`.${EXT_NS}-toggle`);
     if (!toggleBtn) return;
     setToggleIcon(toggleBtn, false);
+  }
+
+  let revealInFlight = false;
+  async function revealEntry(entry) {
+    if (!entry || revealInFlight) return;
+    revealInFlight = true;
+    try {
+      let el = entry.el?.isConnected ? entry.el : messageElement(entry.messageId);
+      if (!el) el = await huntForMessage(entry);
+      if (!el) return;
+      el = (await settleOnElement(entry, el)) || el;
+      if (!el.isConnected) return;
+      entry.el = el;
+      flashElement(el);
+      expandAnswerFor(el);
+    } finally {
+      revealInFlight = false;
+    }
+  }
+
+  function handleIndexItemClick(it) {
+    void revealEntry(it);
   }
 
   function onListClick(event) {
@@ -917,6 +1034,57 @@
     handleIndexItemClick(indexById.get(itemId));
   }
 
+  // When ChatGPT switches conversations it swaps the thread in place, and for
+  // a moment the outgoing conversation's turns are still mounted. Without this
+  // they get indexed into the incoming conversation's list, where they linger
+  // because the index is cumulative.
+  let staleMessageKeys = null;
+  let staleGuardUntil = 0;
+  let staleForPath = "";
+
+  function beginConversationSwitch(targetPath) {
+    // Both the link click and the URL poll call this for the same navigation.
+    // Only the first may snapshot: by the time the second runs, turns from the
+    // *incoming* conversation may already be mounted, and marking those stale
+    // would hide the very questions we are switching to.
+    if (staleMessageKeys && staleForPath === targetPath) return;
+    staleForPath = targetPath;
+    const keys = new Set();
+    for (const el of document.querySelectorAll("[data-message-id], [data-turn-id]")) {
+      const key = CGXDom.stableKey(el);
+      if (key) keys.add(key);
+    }
+    staleMessageKeys = keys.size ? keys : null;
+    staleGuardUntil = Date.now() + STALE_GUARD_MS;
+  }
+
+  function dropStaleTurns(scan) {
+    if (!staleMessageKeys) return scan;
+    if (Date.now() > staleGuardUntil) {
+      // Safety valve: never let the guard wedge the sidebar shut, e.g. if the
+      // incoming conversation happens to be the one we just left.
+      staleMessageKeys = null;
+      return scan;
+    }
+
+    const keep = scan.turns.filter((t) => {
+      const key = CGXDom.stableKey(t.el);
+      return key == null || !staleMessageKeys.has(key);
+    });
+    if (keep.length === scan.turns.length) {
+      staleMessageKeys = null;
+      return scan;
+    }
+
+    const user = [];
+    const assistant = [];
+    for (const t of keep) {
+      if (t.role === CGXDom.ROLE_USER) user.push(t.el);
+      else if (t.role === CGXDom.ROLE_ASSISTANT) assistant.push(t.el);
+    }
+    return { strategy: scan.strategy, turns: keep, user, assistant };
+  }
+
   function renderIfNeeded(changed, q) {
     if (changed || q !== lastRenderedFilter || forceFullScan) {
       renderList(currentIndex, q);
@@ -924,58 +1092,156 @@
     }
   }
 
-  // ChatGPT tags each turn as article[data-testid="conversation-turn-N"]; N is a
-  // stable, absolute position we can order by even when only a window of turns is
-  // mounted. Returns null when the turn number can't be read.
-  function conversationTurnNumber(el) {
-    const testId = el?.closest?.("article[data-testid^='conversation-turn-']")?.getAttribute?.("data-testid");
-    if (!testId) return null;
-    const n = Number(testId.slice(18)); // "conversation-turn-".length === 18
-    return Number.isFinite(n) ? n : null;
-  }
+  // Insert or refresh a prompt in the cumulative store. Returns the entry plus
+  // whether the ordered view needs rebuilding (new entry, or title/turn
+  // changed). A moved DOM node (same id) just refreshes `el` silently.
+  function upsertUserEntry(el, domIndex, seenThisScan) {
+    let id = stableIdForElement(el, domIndex, CGXDom.ROLE_USER);
 
-  // Insert or refresh a prompt in the cumulative store. Returns true when the
-  // ordered view needs rebuilding (new entry, or title/turn changed). A moved
-  // DOM node (same id) just refreshes `el` silently — no re-render required.
-  function upsertUserEntry(el, domIndex) {
-    const id = stableIdForElement(el, domIndex);
+    // Two different prompts resolved to the same id — only possible via the
+    // text-hash fallback, when a question was asked twice verbatim. Give the
+    // later one its own id so both stay listed.
+    if (seenThisScan?.has(id)) {
+      let suffix = 2;
+      while (seenThisScan.has(`${id}#${suffix}`)) suffix++;
+      id = `${id}#${suffix}`;
+      el.setAttribute(`data-${EXT_NS}-id`, id);
+    }
+    seenThisScan?.add(id);
+
     const title = getCachedTitle(el) || "[Media]";
-    const turn = conversationTurnNumber(el);
+    const turn = CGXDom.turnNumber(el);
     const existing = indexById.get(id);
     if (!existing) {
-      indexById.set(id, {
+      const entry = {
         id,
         el,
+        messageId: CGXDom.stableKey(el),
         title,
         titleLower: title.toLowerCase(),
         turn,
+        rank: null,
+        apiIndex: null,
         seq: discoverySeq++,
         idx: 0,
         anchorHint: ""
-      });
-      return true;
+      };
+      indexById.set(id, entry);
+      return { entry, changed: true };
     }
+
     existing.el = el;
+    if (!existing.messageId) existing.messageId = CGXDom.stableKey(el);
     let changed = false;
-    if (existing.title !== title) {
+    // The API text is the whole prompt; the DOM version is whatever survived
+    // rendering, so don't let a rescan downgrade it.
+    if (existing.apiIndex == null && existing.title !== title) {
       existing.title = title;
       existing.titleLower = title.toLowerCase();
       changed = true;
     }
-    if (existing.turn !== turn) {
+    // Never clobber a known turn number with null. Ordering switches to
+    // relative ranks the moment a single entry loses its number, so a
+    // transient read failure must not flip the whole list.
+    if (turn != null && existing.turn !== turn) {
       existing.turn = turn;
       changed = true;
     }
-    return changed;
+    return { entry: existing, changed };
+  }
+
+  // ---------- Conversation API ----------
+  // The API is authoritative for *which* prompts exist and in what order; the
+  // DOM only supplies live elements to scroll to and fold. Everything here
+  // degrades to null/no-op if the fetch fails, leaving the DOM path in charge.
+  let apiOrder = null; // messageId -> position on the active branch
+  let apiLoadedForPath = "";
+
+  function titleFromApiMessage(message) {
+    const files = dedupeStrings(message.attachments || []);
+    const firstLine = (message.text || "").split("\n").find((line) => line.trim()) || message.text || "";
+    const base = textPreview(firstLine, 90);
+    if (files.length) return bracketUploadedFileNames(base, files) || `[${files[0]}]`;
+    if (base) return bracketStandaloneFileTitle(base);
+    return message.mediaCount ? "[Media]" : "[Empty]";
+  }
+
+  function mergeApiMessages(messages) {
+    const keep = new Set();
+
+    for (const message of messages) {
+      if (message.role !== CGXDom.ROLE_USER) continue;
+      const id = `${EXT_NS}_${message.id}`;
+      keep.add(id);
+      const title = titleFromApiMessage(message);
+      const existing = indexById.get(id);
+      if (existing) {
+        existing.apiIndex = message.index;
+        existing.messageId = message.id;
+        if (existing.title !== title) {
+          existing.title = title;
+          existing.titleLower = title.toLowerCase();
+        }
+        continue;
+      }
+      indexById.set(id, {
+        id,
+        el: null,
+        messageId: message.id,
+        title,
+        titleLower: title.toLowerCase(),
+        turn: null,
+        rank: null,
+        apiIndex: message.index,
+        seq: discoverySeq++,
+        idx: 0,
+        anchorHint: ""
+      });
+    }
+
+    // Drop anything the API didn't list. A prompt that is on screen right now
+    // is on the active branch by definition, so it survives even if it arrived
+    // after the fetch; the rest are abandoned edit branches or leftovers from
+    // a conversation we already navigated away from.
+    for (const [id, entry] of Array.from(indexById)) {
+      if (keep.has(id) || entry.el?.isConnected) continue;
+      indexById.delete(id);
+    }
+  }
+
+  async function loadFromApi(epoch) {
+    const conversationId = CGXApi.conversationIdFromPath();
+    if (!conversationId) return;
+
+    const result = await CGXApi.fetchConversation(conversationId);
+    if (!result || epoch !== routeEpoch) return;
+
+    apiOrder = result.order;
+    apiLoadedForPath = location.pathname;
+    mergeApiMessages(result.messages);
+    rebuildOrderedIndex();
+    renderList(currentIndex, getSidebarFilterValue());
+    // Re-attach element references for whatever ChatGPT has actually mounted.
+    forceFullScan = true;
+    await scanAndRender();
   }
 
   function mergeUserNodesIntoIndex(userNodes) {
     let changed = false;
+    const seenThisScan = new Set();
+    const observed = [];
+
     for (let i = 0; i < userNodes.length; i++) {
       const el = userNodes[i];
-      if (isComposerArea(el)) continue;
-      if (upsertUserEntry(el, i)) changed = true;
+      if (CGXDom.isComposer(el)) continue;
+      const { entry, changed: entryChanged } = upsertUserEntry(el, i, seenThisScan);
+      if (entryChanged) changed = true;
+      observed.push(entry);
     }
+
+    // Keep relative ranks current even when absolute turn numbers are
+    // available, so ordering survives ChatGPT dropping that attribute later.
+    if (observed.length && CGXOrder.reconcile(observed, indexById.values())) changed = true;
     return changed;
   }
 
@@ -984,38 +1250,47 @@
   // in favour of the live in-DOM entry, pruning the stale branch from the store.
   function rebuildOrderedIndex() {
     const entries = Array.from(indexById.values());
-    const byTurn = new Map();
-    const untimed = [];
-    for (const e of entries) {
-      if (e.turn == null) {
-        untimed.push(e);
-        continue;
-      }
-      const prev = byTurn.get(e.turn);
-      if (!prev) {
-        byTurn.set(e.turn, e);
-        continue;
-      }
-      const eLive = !!e.el?.isConnected;
-      const prevLive = !!prev.el?.isConnected;
-      if (eLive !== prevLive ? eLive : e.seq > prev.seq) byTurn.set(e.turn, e);
+    if (!entries.length) {
+      setCurrentIndex([]);
+      return;
     }
 
-    const ordered = [...byTurn.values(), ...untimed];
-    if (ordered.length !== entries.length) {
-      const keep = new Set(ordered);
-      for (const [id, e] of indexById) {
-        if (!keep.has(e)) indexById.delete(id);
+    if (entries.every(CGXOrder.hasTurn)) {
+      const byTurn = new Map();
+      for (const e of entries) {
+        const prev = byTurn.get(e.turn);
+        if (!prev) {
+          byTurn.set(e.turn, e);
+          continue;
+        }
+        const eLive = !!e.el?.isConnected;
+        const prevLive = !!prev.el?.isConnected;
+        if (eLive !== prevLive ? eLive : e.seq > prev.seq) byTurn.set(e.turn, e);
+      }
+      if (byTurn.size !== entries.length) {
+        const keep = new Set(byTurn.values());
+        for (const [id, e] of indexById) {
+          if (!keep.has(e)) indexById.delete(id);
+        }
       }
     }
 
-    ordered.sort((a, b) => {
-      const at = a.turn == null ? Infinity : a.turn;
-      const bt = b.turn == null ? Infinity : b.turn;
-      return at - bt || a.seq - b.seq;
-    });
+    const ordered = CGXOrder.sortEntries(indexById.values());
     for (let i = 0; i < ordered.length; i++) ordered[i].idx = i + 1;
     setCurrentIndex(ordered);
+  }
+
+  function renderPlaceholder(text) {
+    const list = ensureSidebar().querySelector("#cgx-list");
+    const existing = list.firstElementChild;
+    if (list.childElementCount === 1 && existing?.classList?.contains("cgx-muted")) {
+      if (existing.textContent !== text) existing.textContent = text;
+      return;
+    }
+    const div = document.createElement("div");
+    div.className = "cgx-muted";
+    div.textContent = text;
+    list.replaceChildren(div);
   }
 
   function renderList(indexItems, filterLower) {
@@ -1029,73 +1304,66 @@
     });
 
     if (!items.length) {
-      if (list.childElementCount === 1 && list.firstElementChild?.classList?.contains("cgx-muted")) return;
-      list.innerHTML = "";
-      const div = document.createElement("div");
-      div.className = "cgx-muted";
-      div.textContent = "No questions found.";
-      list.appendChild(div);
+      renderPlaceholder(filterLower ? "No questions match." : "No questions found.");
       return;
     }
 
-    const existing = list.querySelectorAll(".cgx-item[data-cgx-id]");
     const existingById = new Map();
-    for (const el of existing) existingById.set(el.getAttribute("data-cgx-id"), el);
+    for (const el of list.querySelectorAll(".cgx-item[data-cgx-id]")) {
+      existingById.set(el.getAttribute("data-cgx-id"), el);
+    }
+    list.querySelector(".cgx-muted")?.remove();
 
-    const muted = list.querySelector(".cgx-muted");
-    if (muted) muted.remove();
-
-    const fragment = document.createDocumentFragment();
+    // Keyed, in-place reconciliation. Collecting the cards into a fragment and
+    // re-appending would detach every child, which empties the list for an
+    // instant and resets its scroll position — so walk the existing nodes and
+    // only move the ones that are genuinely out of place. Appending a new
+    // question at the end costs exactly one DOM insertion.
+    let cursor = list.firstElementChild;
     for (const it of items) {
       let card = existingById.get(it.id);
       if (card) {
         existingById.delete(it.id);
-        const qEl = card.querySelector(".q");
-        if (qEl && qEl.textContent !== (it.title || "")) qEl.textContent = it.title || "";
-        const metaSpans = card.querySelectorAll(".meta span");
-        if (metaSpans[0]) {
-          const idxText = `#${it.idx}`;
-          if (metaSpans[0].textContent !== idxText) metaSpans[0].textContent = idxText;
-        }
+        updateItemCard(card, it);
       } else {
-        card = document.createElement("div");
-        card.className = "cgx-item";
-        const meta = document.createElement("div");
-        meta.className = "meta";
-        const spanIdx = document.createElement("span");
-        spanIdx.textContent = `#${it.idx}`;
-        const spanHint = document.createElement("span");
-        spanHint.textContent = it.anchorHint || "";
-        meta.append(spanIdx, spanHint);
-        const q = document.createElement("div");
-        q.className = "q";
-        q.textContent = it.title || "";
-        card.append(meta, q);
-        card.setAttribute("data-cgx-id", it.id);
+        card = createItemCard(it);
       }
-      fragment.appendChild(card);
+      if (card === cursor) {
+        cursor = cursor.nextElementSibling;
+        continue;
+      }
+      list.insertBefore(card, cursor);
     }
     for (const stale of existingById.values()) stale.remove();
-    list.appendChild(fragment);
   }
 
-  function getRoleNodesFast() {
-    // Single document traversal, then partition by role. Halves the DOM
-    // work of the previous two-querySelectorAll approach on the hot path.
-    const roleNodes = document.querySelectorAll(MESSAGE_ROLE_SELECTOR);
-    if (!roleNodes.length) return null;
-    const userNodes = [];
-    const assistantNodes = [];
-    for (const node of roleNodes) {
-      const role = node.getAttribute("data-message-author-role");
-      if (role === "user") userNodes.push(node);
-      else if (role === "assistant") assistantNodes.push(node);
-    }
-    if (!userNodes.length && !assistantNodes.length) return null;
-    return { userNodes, assistantNodes };
+  function createItemCard(it) {
+    const card = document.createElement("div");
+    card.className = "cgx-item";
+    const meta = document.createElement("div");
+    meta.className = "meta";
+    const spanIdx = document.createElement("span");
+    spanIdx.textContent = `#${it.idx}`;
+    const spanHint = document.createElement("span");
+    spanHint.textContent = it.anchorHint || "";
+    meta.append(spanIdx, spanHint);
+    const q = document.createElement("div");
+    q.className = "q";
+    q.textContent = it.title || "";
+    card.append(meta, q);
+    card.setAttribute("data-cgx-id", it.id);
+    return card;
   }
 
-  function getRoleNodeSignaturePart(node, idx) {
+  function updateItemCard(card, it) {
+    const qEl = card.querySelector(".q");
+    if (qEl && qEl.textContent !== (it.title || "")) qEl.textContent = it.title || "";
+    const idxEl = card.querySelector(".meta span");
+    const idxText = `#${it.idx}`;
+    if (idxEl && idxEl.textContent !== idxText) idxEl.textContent = idxText;
+  }
+
+  function getNodeSignaturePart(node, idx) {
     if (!node) return `i${idx}`;
     return (
       node.getAttribute?.("data-message-id") ||
@@ -1106,56 +1374,25 @@
     );
   }
 
-  function buildRoleNodeSignature(nodes) {
+  function buildNodeSignature(nodes) {
     const len = nodes?.length || 0;
     if (!len) return "0";
-    if (len === 1) return `1:${getRoleNodeSignaturePart(nodes[0], 0)}`;
-    if (len === 2) return `2:${getRoleNodeSignaturePart(nodes[0], 0)}|${getRoleNodeSignaturePart(nodes[1], 1)}`;
+    if (len === 1) return `1:${getNodeSignaturePart(nodes[0], 0)}`;
+    if (len === 2) return `2:${getNodeSignaturePart(nodes[0], 0)}|${getNodeSignaturePart(nodes[1], 1)}`;
     const mid = Math.floor((len - 1) / 2);
-    return `${len}:${getRoleNodeSignaturePart(nodes[0], 0)}|${getRoleNodeSignaturePart(nodes[mid], mid)}|${getRoleNodeSignaturePart(nodes[len - 1], len - 1)}`;
+    return `${len}:${getNodeSignaturePart(nodes[0], 0)}|${getNodeSignaturePart(nodes[mid], mid)}|${getNodeSignaturePart(nodes[len - 1], len - 1)}`;
   }
 
-  function syncAssistantTogglesFast(assistantNodes) {
+  function syncAssistantToggles(assistantNodes) {
     for (let i = 0; i < assistantNodes.length; i++) {
       const el = assistantNodes[i];
-      if (isComposerArea(el)) continue;
-      const id = stableIdForElement(el, i);
+      if (CGXDom.isComposer(el)) continue;
+      const id = stableIdForElement(el, i, CGXDom.ROLE_ASSISTANT);
       const existing = el.querySelector?.(`button.${EXT_NS}-toggle`);
       if (!existing || existing.dataset?.cgxBound !== "1") {
         injectToggleForAssistant(el, id);
       }
     }
-  }
-
-  function scanIndexFallback() {
-    const blocks = findAllMessageBlocks();
-    let changed = false;
-    const keepToggles = new Set();
-
-    for (let i = 0; i < blocks.length; i++) {
-      const el = blocks[i];
-      if (isComposerArea(el)) continue;
-      const role = getRole(el);
-
-      if (role === "assistant") {
-        const id = stableIdForElement(el, i);
-        const btn = injectToggleForAssistant(el, id);
-        if (btn) keepToggles.add(btn);
-        continue;
-      }
-
-      if (role !== "user") continue;
-      if (!isElementVisible(el)) continue;
-      if (upsertUserEntry(el, i)) changed = true;
-    }
-    document.querySelectorAll(`.${EXT_NS}-toggle`).forEach((btn) => {
-      if (!keepToggles.has(btn)) btn.remove();
-    });
-    document.querySelectorAll(`.${EXT_NS}-toggle-wrap`).forEach((wrap) => {
-      const btn = wrap.querySelector?.(`.${EXT_NS}-toggle`);
-      if (!btn || !keepToggles.has(btn)) wrap.remove();
-    });
-    return changed;
   }
 
   async function scanAndRender(options = {}) {
@@ -1164,39 +1401,29 @@
 
     const sb = ensureSidebar();
     const q = getSidebarFilterValue(sb);
-    const roleNodes = getRoleNodesFast();
 
     pauseObserver();
     try {
-      if (roleNodes) {
-        const userSignature = buildRoleNodeSignature(roleNodes.userNodes);
-        const assistantSignature = buildRoleNodeSignature(roleNodes.assistantNodes);
-        const userChanged = forceFullScan || userSignature !== lastUserSignature;
-        const assistantChanged = forceFullScan || assistantSignature !== lastAssistantSignature;
+      const scan = dropStaleTurns(CGXDom.scanTurns());
+      lastScanTurns = scan.turns;
 
-        if (assistantChanged) {
-          syncAssistantTogglesFast(roleNodes.assistantNodes);
-        }
+      const userSignature = buildNodeSignature(scan.user);
+      const assistantSignature = buildNodeSignature(scan.assistant);
+      const userChanged = forceFullScan || userSignature !== lastUserSignature;
+      const assistantChanged = forceFullScan || assistantSignature !== lastAssistantSignature;
 
-        if (userChanged) {
-          const changed = mergeUserNodesIntoIndex(roleNodes.userNodes);
-          if (changed) rebuildOrderedIndex();
-          renderIfNeeded(changed, q);
-        } else {
-          renderIfNeeded(false, q);
-        }
+      if (assistantChanged) syncAssistantToggles(scan.assistant);
 
-        lastUserSignature = userSignature;
-        lastAssistantSignature = assistantSignature;
-        forceFullScan = false;
-        return;
+      if (userChanged) {
+        const changed = mergeUserNodesIntoIndex(scan.user);
+        if (changed) rebuildOrderedIndex();
+        renderIfNeeded(changed, q);
+      } else {
+        renderIfNeeded(false, q);
       }
 
-      const fallbackChanged = scanIndexFallback();
-      if (fallbackChanged) rebuildOrderedIndex();
-      renderIfNeeded(fallbackChanged, q);
-      lastUserSignature = "";
-      lastAssistantSignature = "";
+      lastUserSignature = userSignature;
+      lastAssistantSignature = assistantSignature;
       forceFullScan = false;
     } finally {
       resumeObserver();
@@ -1206,28 +1433,39 @@
   // ---------- Observe & init ----------
   let debounceTimer = null;
   let idleHandle = null;
+  let pendingSince = 0;
+
+  function runScheduledScan() {
+    debounceTimer = null;
+    pendingSince = 0;
+    if (idleHandle && window.cancelIdleCallback) {
+      cancelIdleCallback(idleHandle);
+      idleHandle = null;
+    }
+    if (window.requestIdleCallback) {
+      idleHandle = requestIdleCallback(
+        () => {
+          idleHandle = null;
+          scanAndRender();
+        },
+        { timeout: IDLE_TIMEOUT_MS }
+      );
+    } else {
+      scanAndRender();
+    }
+  }
+
   function scheduleScan() {
     if (!isChatRoute()) return;
     if (observeTarget && !document.contains(observeTarget)) startObserver();
+    const now = Date.now();
+    if (!pendingSince) pendingSince = now;
+    // Plain debouncing never fires while an answer streams, because each
+    // token resets it. Clamp the delay by how long we have already waited so
+    // a scan always lands within MAX_SCAN_DELAY_MS of the first mutation.
+    const delay = Math.max(0, Math.min(DEBOUNCE_MS, MAX_SCAN_DELAY_MS - (now - pendingSince)));
     if (debounceTimer) clearTimeout(debounceTimer);
-    debounceTimer = setTimeout(() => {
-      debounceTimer = null;
-      if (idleHandle && window.cancelIdleCallback) {
-        cancelIdleCallback(idleHandle);
-        idleHandle = null;
-      }
-      if (window.requestIdleCallback) {
-        idleHandle = requestIdleCallback(
-          () => {
-            idleHandle = null;
-            scanAndRender();
-          },
-          { timeout: IDLE_TIMEOUT_MS }
-        );
-      } else {
-        scanAndRender();
-      }
-    }, DEBOUNCE_MS);
+    debounceTimer = setTimeout(runScheduledScan, delay);
   }
 
   let mo = null;
@@ -1236,6 +1474,7 @@
   let routeEpoch = 0;
 
   function clearScheduledScan() {
+    pendingSince = 0;
     if (debounceTimer) {
       clearTimeout(debounceTimer);
       debounceTimer = null;
@@ -1254,12 +1493,21 @@
   }
 
   function startObserver() {
-    const nextTarget = document.querySelector("main") || document.body;
+    const nextTarget = CGXDom.conversationRoot();
     if (mo && observeTarget === nextTarget) return;
     stopObserver();
     observeTarget = nextTarget;
     mo = new MutationObserver((records) => {
       if (observerPaused) return;
+      // The new thread rendering is frequently the first observable sign that
+      // the route moved, since we cannot hook the page's navigation calls.
+      // Catching it here rather than waiting for the next poll tick is what
+      // keeps the incoming conversation from being merged into the outgoing
+      // conversation's list.
+      if (location.pathname !== lastPath) {
+        void handleRouteChange();
+        return;
+      }
       const { hasChange, hasRemoval } = classifyMutations(records);
       if (!hasChange) return;
       if (hasRemoval) forceFullScan = true;
@@ -1283,14 +1531,21 @@
     clearSearchRenderTimer();
     resetScanState();
     ensureSidebar();
+    // Replace the outgoing conversation's questions straight away — leaving
+    // them up while the new thread renders is what made switching feel slow.
+    renderPlaceholder("Loading questions…");
     applySidebarDefaultVisibility();
     startObserver();
 
+    // Start the fetch before anything else — it is what fills the sidebar for
+    // long threads, and it runs while the DOM scan produces a partial list.
+    const apiLoad = loadFromApi(epoch).catch(() => {});
+
     const loadedState = await loadState();
     if (epoch !== routeEpoch || !isChatRoute()) return;
-    stateCache = loadedState || { collapsed: {} };
-    stateCache.collapsed = stateCache.collapsed || {};
+    stateCache = loadedState;
     await scanAndRender();
+    await apiLoad;
   }
 
   function deactivateForNonChat() {
@@ -1306,8 +1561,10 @@
     const path = location.pathname || "";
     if (path === lastPath) return;
     const epoch = ++routeEpoch;
+    const wasChat = isChatRoute(lastPath);
     lastPath = path;
     if (isChatRoute(path)) {
+      if (wasChat) beginConversationSwitch(path);
       stopObserver();
       await activateForChat(epoch);
     } else {
@@ -1335,14 +1592,37 @@
     return pathnameFromHref(anchor.getAttribute("href"));
   }
 
+  let navIntentTimer = null;
+
+  // Clicking a conversation link is the earliest notice we get that the thread
+  // is about to change — it arrives before the URL does, and unlike pushState
+  // the click event crosses into our world. Clearing here is what stops the
+  // outgoing conversation's questions from sitting under the new ones.
   function applyFastNavIntent(path) {
     if (!path || path === location.pathname) return;
-    if (isChatRoute(path)) {
-      ensureSidebar();
-      applySidebarDefaultVisibility();
+    if (!isChatRoute(path)) {
+      deactivateForNonChat();
       return;
     }
-    deactivateForNonChat();
+
+    ensureSidebar();
+    applySidebarDefaultVisibility();
+    if (!isChatRoute()) return;
+
+    beginConversationSwitch(path);
+    renderPlaceholder("Loading questions…");
+
+    // The click might not lead anywhere — a cancelled navigation, or a link
+    // handled some other way. Restore what we were showing if the URL never
+    // catches up.
+    if (navIntentTimer) clearTimeout(navIntentTimer);
+    navIntentTimer = setTimeout(() => {
+      navIntentTimer = null;
+      if (location.pathname === path || location.pathname !== lastPath) return;
+      staleMessageKeys = null;
+      staleForPath = "";
+      renderList(currentIndex, getSidebarFilterValue());
+    }, NAV_INTENT_TIMEOUT_MS);
   }
 
   function installRouteListeners() {
@@ -1432,5 +1712,5 @@
     });
   }
 
-  setTimeout(init, 600);
+  setTimeout(init, INIT_DELAY_MS);
 })();

@@ -1,0 +1,12 @@
+{
+  "name": "chatgpt-navigator-ext",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Chrome extension: jump between questions, fold long answers, stay focused.",
+  "scripts": {
+    "test": "node tools/test-turn-order.js && node tools/test-dom-adapter.js && node tools/test-content-smoke.js && node tools/test-api-index.js && node tools/test-conversation-switch.js"
+  },
+  "devDependencies": {
+    "jsdom": "^26.0.0"
+  }
+}
